@@ -3023,10 +3023,16 @@ FX_TEST(neon_wave_s_broadcast_fsqrt_and_const_fparith) {
         fsqrt4s(15, 15),           // must use vec_broadcast scalar vsqrtss + vpbroadcastd
         mov16b(13, 15),            // MOV propagates vec_broadcast
         fsqrt4s(13, 13),           // second broadcast FSQRT
+        // 1b. In-place DUP.4S/.2D lane 0 elided before broadcast FSQRT (T4)
+        dup4s(15, 15, 0),
+        fadd4s(14, 14, 1),         // intervening non-reader
+        fsqrt4s(15, 15),
         // 2. Non-adjacent DUP.2D + intervening op + FSQRT.2D
         fabs2d(3, 3),
         dup2d(12, 3, 1),
         fadd2d(11, 4, 5),
+        fsqrt2d(12, 12),
+        dup2d(12, 12, 0),
         fsqrt2d(12, 12),
         // 3. MOVI + FMUL/FADD/FSUB/FDIV (.4S): 0x3f<<24 = 0x3f000000 = 0.5f, 0x40<<24 = 2.0f
         movi4s_lsl24(6, 0x3fu),    // v6 = {0.5f}
@@ -3136,11 +3142,29 @@ FX_TEST(fp_region_minmax_qnan_no_spurious_ioc) {
         }
     }
 
-    // 2. Vector .4S/.2D single deferred + const deferred_single + 2-op chain cold stub.
+    // 2. Scalar constant-operand FMAX/FMIN/FMAXNM/FMINNM with quiet-proven x
+    //    (emit_minmax_const Match::scalar_quiet_nan): qNaN must keep FPSR.IOC == 0.
+    //    fadd s1, s1, s4 sets vec_fp_quiet(1) while preserving qNaN; fmov s2, #1.0 (0x1e2e1002)
+    //    or fmov s2, wzr (0x1e2703e2, +0.0) provides the known constant.
+    for (const std::uint32_t load_c : {0x1e2e1002u, 0x1e2703e2u}) {
+        for (const std::uint32_t op : {0x1e226823u, 0x1e227823u, 0x1e224823u, 0x1e225823u,
+                                       0x1e226821u, 0x1e227821u}) {
+            auto ctx = runner.context(99150);
+            ctx.v[1][0] = 0x7fc00001ULL; ctx.v[1][1] = 0;
+            ctx.v[4][0] = 0x00000000ULL; ctx.v[4][1] = 0;
+            run_check({0x1e242821u, load_c, op}, ctx, 0u, "scalar const quiet minmax qnan no ioc");
+        }
+    }
+
+    // 3. Vector .4S/.2D single deferred + const deferred_single + 2-op chain + const-start chain.
     const std::vector<std::uint32_t> vec_single{0x4e22c423u};                  // fmaxnm v3.4s, v1.4s, v2.4s
     const std::vector<std::uint32_t> vec_const{0x4f03f610u, 0x4eb0c423u};      // fmov v16.4s, #1.0; fminnm v3.4s, v1.4s, v16.4s
     const std::vector<std::uint32_t> vec_chain{0x4e22c423u, 0x4ea2f464u};      // fmaxnm v3.4s, v1, v2; fmin v4.4s, v3, v2
-    for (const auto& prog : {vec_single, vec_const, vec_chain}) {
+    const std::vector<std::uint32_t> vec_const_chain{
+        0x4f03f610u, 0x4e30c423u,   // fmov v16.4s, #1.0; fmaxnm v3.4s, v1.4s, v16.4s
+        0x4f00f411u, 0x4eb1c464u,   // fmov v17.4s, #2.0; fminnm v4.4s, v3.4s, v17.4s
+    };
+    for (const auto& prog : {vec_single, vec_const, vec_chain, vec_const_chain}) {
         auto ctx_q = runner.context(99200);
         const auto pq1 = pack4(0x7fc00001u, 0x40000000u, 0x80000000u, 0x3f800000u);
         const auto pq2 = pack4(0x3f800000u, 0x7fc00002u, 0x00000000u, 0xbf800000u);

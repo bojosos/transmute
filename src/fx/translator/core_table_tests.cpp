@@ -1079,3 +1079,77 @@ FX_TEST(table_dispatch_interleaved_shadow_explicit) {
     FX_CHECK(r.run(w, r.context(8300), "wave o1 wide-gap switch raw nzcv"));
     if (tables_enabled()) FX_CHECK_EQ(r.last.lookups, 0u);
 }
+
+// Wave T2a: Hoisted immutable table pointer guarded by `cmp xT, table_addr; jne generic`.
+// Verifies 0 lookups on the fast path AND exact fallback when xT is switched to a
+// different table dynamically at runtime.
+FX_TEST(table_dispatch_hoisted_guarded) {
+    auto& r = runner();
+    using namespace a64;
+    std::vector<std::uint32_t> w;
+    w.push_back(movw(false, 2, 0, 24, 12));                         // 0  movz w12, #24
+    const auto adr_tab1_at = w.size();
+    w.push_back(adr(false, 0, 8));                                  // 1  adr x8, table1 (hoisted before loop!)
+    const auto adr_tab2_at = w.size();
+    w.push_back(adr(false, 0, 13));                                 // 2  adr x13, table2
+    const auto dispatch = w.size();
+    w.push_back(add_imm(false, false, false, 11, 11, 1));           // 3  add w11, w11, #1
+    w.push_back(logic_imm(false, 0, 0, 0, 1, 11, 11));              // 4  and w11, w11, #3
+    w.push_back(add_imm(false, true, true, 31, 11, 3));             // 5  cmp w11, #3
+    const auto b_hi_at = w.size();
+    w.push_back(bcond(8, 0));                                       // 6  b.hi default
+    const auto adr_base_at = w.size();
+    w.push_back(adr(false, 0, 9));                                  // 7  adr x9, base
+    w.push_back(ldst_reg(2, 2, 11, 3, true, 8, 10));                // 8  ldrsw x10, [x8, x11, lsl #2]
+    w.push_back(add_shift(true, false, false, 0, 10, 0, 9, 9));     // 9  add x9, x9, x10
+    w.push_back(br(9));                                             // 10 br x9
+    std::size_t case_at[4]{};
+    std::vector<std::size_t> to_tail;
+    for (unsigned k = 0; k < 4; ++k) {
+        case_at[k] = w.size();
+        w.push_back(add_imm(true, false, false, 0, 0, 10 + k * 7));
+        to_tail.push_back(w.size());
+        w.push_back(b(0));
+    }
+    const auto def_at = w.size();
+    w.push_back(add_imm(true, false, false, 0, 0, 99));
+    const auto tail = w.size();
+    // If x15 != 0 and w12 == 12, swap x8 to table2 to exercise the table_reg guard fallback!
+    w.push_back(add_imm(false, true, true, 31, 12, 12));            // cmp w12, #12
+    w.push_back(csel(true, false, 8, 0, 0, 13, 14));                // csel x14, x13, x8, eq (rn=13, rm=8)
+    w.push_back(add_imm(true, true, true, 31, 15, 0));              // cmp x15, #0
+    w.push_back(csel(true, false, 8, 1, 0, 14, 8));                 // csel x8, x14, x8, ne (rn=14, rm=8)
+    w.push_back(add_imm(false, true, true, 12, 12, 1));             // subs w12, w12, #1
+    w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+    const auto to_end = w.size();
+    w.push_back(b(0));
+    const auto tab1_at = w.size();
+    for (unsigned k = 0; k < 4; ++k) {
+        const auto off = static_cast<std::int32_t>(4 * (static_cast<std::int64_t>(case_at[k]) - static_cast<std::int64_t>(adr_base_at)));
+        w.push_back(static_cast<std::uint32_t>(off));
+    }
+    const auto tab2_at = w.size();
+    for (unsigned k = 0; k < 4; ++k) {
+        // Reversed mapping in table2 so taking the wrong table immediately mismatches oracle!
+        const auto off = static_cast<std::int32_t>(4 * (static_cast<std::int64_t>(case_at[3 - k]) - static_cast<std::int64_t>(adr_base_at)));
+        w.push_back(static_cast<std::uint32_t>(off));
+    }
+    const auto end = w.size();
+    w[b_hi_at] = bcond(8, static_cast<std::int32_t>(def_at) - static_cast<std::int32_t>(b_hi_at));
+    w[adr_tab1_at] = adr(false, static_cast<std::int32_t>(4 * (tab1_at - adr_tab1_at)), 8);
+    w[adr_tab2_at] = adr(false, static_cast<std::int32_t>(4 * (tab2_at - adr_tab2_at)), 13);
+    for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+    w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+
+    // 1. Fast path: x15 = 0 keeps x8 == table1 for all 24 iterations -> 0 lookups.
+    auto ctx1 = r.context(0x72a1);
+    ctx1.x[15] = 0;
+    FX_CHECK(r.run(w, ctx1, "hoisted guarded fast path"));
+    if (tables_enabled()) FX_CHECK_EQ(r.last.lookups, 0u);
+
+    // 2. Dynamic table swap: x15 = 1 switches x8 to table2 mid-loop -> guard falls back accurately.
+    auto ctx2 = r.context(0x72a2);
+    ctx2.x[15] = 1;
+    FX_CHECK(r.run(w, ctx2, "hoisted guarded fallback swap"));
+    if (tables_enabled()) FX_CHECK(r.last.lookups >= 1u);
+}

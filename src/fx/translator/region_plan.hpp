@@ -99,8 +99,10 @@ struct JumpTable {
     std::uint32_t count;              // entries (bound from cmp + b.hi/b.hs, uxtb, ...)
     std::uint8_t index_reg;           // wI: the table index at the BR (UXTW); unused by_target
     bool by_target{};                 // dispatch on the target (index unknown at the BR)
-    bool proven_bounded{};            // immutable image code + straight-line bound: generic fallback unreachable
+    bool proven_bounded{};            // immutable image code + straight-line bound: generic fallback unreachable (or guarded by table_reg)
     bool cases_flags_dead{};          // all table targets write NZCV before reading it (only generic may need raw flags)
+    std::int8_t table_reg{-1};        // >= 0: hoisted table address register guarded against table_addr
+    std::uint64_t table_addr{};       // expected immutable table address when table_reg >= 0
 };
 
 struct PlanEntry {

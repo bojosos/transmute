@@ -1804,6 +1804,12 @@ unsigned RegionEmitter::try_fuse_cset_bool(const Inst& d) {
     if (!gpr_dead_after(index_ + 4, w1) || !gpr_dead_after(index_ + 4, w2) || !gpr_dead_after(index_ + 4, w3))
         return 0;
 
+    // Protect c1's cached operands from being chosen as the eviction victim by
+    // alloc() for t1, avoiding a spill immediately followed by a reload.
+    if (std::popcount(free_gpr_) > 2) {
+        if (c1.rn < 31 && !pinned(c1.rn)) (void)borrow_gpr(c1.rn);
+        if (!cmp_imm && c1.rm < 31 && !pinned(c1.rm) && std::popcount(free_gpr_) > 2) (void)borrow_gpr(c1.rm);
+    }
     const auto t1 = alloc();
     a_.setcc(x64::invert(condition(d.cond)), t1);
     const unsigned cbits = c1.sf ? 64 : 32;

@@ -263,6 +263,7 @@ struct TableMatch {
     bool absolute;       // 8-byte entries holding the targets themselves (label tables)
     bool straight_bound; // immutable image code + ADR/ADRP table/base + straight-line bound
     bool need_zext32;    // 64-bit table index load guarded by 32-bit CMP: require ext_zero32
+    std::int8_t table_reg{-1};   // >= 0: hoisted table address reg guarded against `table`
     std::uint64_t bound_pc;
     const char* fail;    // diagnostics: the step that did not match
 };
@@ -688,11 +689,12 @@ bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, Table
     for (int j = ld - 1; j >= lo && tdef < 0; --j)
         if (writes_scan(insts[j], fam_writes[j], rt)) tdef = j;
     const auto window_pc = br_pc - 4u * (kTableScan - static_cast<unsigned>(lo));   // insts[lo]
+    bool hoisted_table = false;
     if (tdef >= 0) {
         if (!adr_value(insts, fam_writes, lo, tdef, rt, m.table)) return no("table: not ADR/ADRP+ADD");
     } else {
         if (!far_adr_value(code, window_pc, rt, m.table)) return no("table: no ADR/ADRP+ADD found");
-        by_target = true;
+        hoisted_table = true;
     }
     // The base: xB's writer before the add (likewise).
     int bdef = -1;
@@ -705,11 +707,11 @@ bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, Table
         by_target = true;
     }
     m.index_reg = static_cast<std::uint8_t>(ri);
+    m.table_reg = -1;
     m.size = l.size;
     m.sign = l.mem != MemOp::load;
     m.sign32 = l.mem == MemOp::load_signed32;
     m.shift = a.amount;
-    m.by_target = by_target;
     // The bound: scan back from the table load, kTableBoundScan instructions past the first
     // instruction of the pattern in the window (the table and base setup between them never
     // writes wI). A table address set up before a loop may be early in the window, before wI's
@@ -722,14 +724,26 @@ bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, Table
     bool b64 = false;
     m.count = scan_bound(code, br_pc - 4u * (kTableScan - static_cast<unsigned>(ld)),
                          kTableBoundScan + static_cast<unsigned>(ld - first), ri, &bpc, &b64);
-    // Straight-line bound proof: immutable image code, table and base loaded in
-    // this block, bound check found with no intervening branch/write to index/table/base.
-    if (m.count > 0 && m.count <= kMaxTableEntries && bpc != 0 && tdef >= 0 && bdef >= 0 && code.image_code(br_pc)) {
+    // Straight-line bound proof: immutable image code, base loaded in this
+    // block, bound check found with no intervening branch/write to index/base.
+    // When the table register was hoisted before a loop (tdef < 0), keep
+    // indexed dispatch guarded by `cmp xT, m.table; jne generic` so the host
+    // table load runs in parallel with the guest table load instead of
+    // serializing behind it via by_target.
+    bool rt_live = hoisted_table && rt != ri;
+    for (int j = ld + 1; j < static_cast<int>(kTableScan) && rt_live; ++j)
+        if (writes_scan(insts[j], fam_writes[j], rt)) rt_live = false;
+    if (m.count > 0 && m.count <= kMaxTableEntries && bpc != 0 && bdef >= 0 && code.image_code(br_pc) &&
+        (!hoisted_table || (!by_target && rt_live))) {
         const auto first_pc = br_pc - 4u * (kTableScan - static_cast<unsigned>(first));
         m.bound_pc = std::min(bpc, first_pc);
         m.straight_bound = true;
         m.need_zext32 = !b64 && (l.shift == 3 || l.shift == 7);
+        if (hoisted_table) m.table_reg = static_cast<std::int8_t>(rt);
+    } else if (hoisted_table) {
+        by_target = true;
     }
+    m.by_target = by_target;
     // 0: no bound found (the caller may size an MSVC table from its contents;
     // LLVM places tables in a data section, so by_target ones need a bound).
     if (m.by_target && m.count == 0) return no("no bound");
@@ -1171,6 +1185,8 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         bool by_target;
         bool straight_bound;
         bool need_zext32;
+        std::int8_t table_reg;
+        std::uint64_t table_addr;
         std::uint64_t bound_pc;
     };
     thread_local std::vector<FoundTable> found_tables;
@@ -1361,8 +1377,8 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                             break;
                         }
                     }
-                    found_tables.push_back(
-                        {pc, first, m.count, m.index_reg, m.by_target, m.straight_bound, m.need_zext32, m.bound_pc});
+                    found_tables.push_back({pc, first, m.count, m.index_reg, m.by_target, m.straight_bound,
+                                            m.need_zext32, m.table_reg, m.table, m.bound_pc});
                     if (overrides.table_exits) break;   // every entry a linkable direct exit (cases are own regions)
                     std::uint64_t lo_case = ~0ULL, hi_case = 0;
                     std::vector<std::uint64_t> uniq_cases;
@@ -1554,8 +1570,8 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         if (br < 0) continue;
         auto& pi = plan.insts[static_cast<std::size_t>(br)];
         pi.table = static_cast<std::int32_t>(plan.tables.size());
-        plan.tables.push_back(
-            {static_cast<std::uint32_t>(plan.table_pcs.size()), ft.count, ft.index_reg, ft.by_target, ft.straight_bound, false});
+        plan.tables.push_back({static_cast<std::uint32_t>(plan.table_pcs.size()), ft.count, ft.index_reg, ft.by_target,
+                               ft.straight_bound, false, ft.table_reg, ft.table_addr});
         for (std::uint32_t k = 0; k < ft.count; ++k) {
             const auto t = found_pcs[ft.first + k];
             plan.table_pcs.push_back(t);
@@ -1791,7 +1807,8 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                                             : exit_live(plan.table_pcs[tbl.first + k]);
                     }
                     tbl.cases_flags_dead = !cases_live;
-                    out = tbl.proven_bounded ? cases_live : (strict_flags || cases_live || br_live(i));
+                    out = (tbl.proven_bounded && tbl.table_reg < 0) ? cases_live
+                                                                    : (strict_flags || cases_live || br_live(i));
                 } else {
                     out = strict_flags || (pi.inst.kind != Kind::ret && br_live(i));
                 }

@@ -129,6 +129,7 @@ public:
         return es == 32 ? vdup32_ : es == 64 ? vdup64_ : 0u;
     }
     void note_vec_broadcast(unsigned index, unsigned es) override;
+    [[nodiscard]] bool vec_only_lane0_before_fsqrt(unsigned index, unsigned es) const override;
     // ---- guest address operands (neon; additive): EmitContext::address ----
     x64::Mem address(const GuestAddress& g) override;
     // ---- current context slots (neon/fp; additive): EmitContext::vec_slot ----
@@ -392,7 +393,7 @@ private:
     // convention pins to the context, then, with `restore`, the evicted
     // convention registers back into their hosts. Paths still in the entry
     // state (region-start stubs, return trampolines) pass restore = false.
-    void exit_pins(std::uint64_t dirty, bool restore = true);
+    void exit_pins(std::uint64_t dirty, bool restore = true, std::uint32_t skip_restore = 0);
     [[nodiscard]] bool global(unsigned g) const { return (plan_.globals >> g) & 1u; }
     [[nodiscard]] bool vpinned(unsigned v) const { return plan_.vpin_host[v] >= 0 && !((lent_ >> (32 + v)) & 1u); }
     [[nodiscard]] x64::Xmm vpin(unsigned v) const { return x64::xmm(static_cast<unsigned>(plan_.vpin_host[v])); }

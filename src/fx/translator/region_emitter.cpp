@@ -786,8 +786,11 @@ void RegionEmitter::compute_pin_need() {
                     static_cast<std::uint64_t>(pi.reads) | (static_cast<std::uint64_t>(pi.vreads) << 32);
                 if (pi.shadow_base >= 0) reads |= 1ull << static_cast<unsigned>(pi.shadow_base);
                 if (pi.shadow_index >= 0) reads |= 1ull << static_cast<unsigned>(pi.shadow_index);
-                if (pi.table >= 0 && !plan_.tables[static_cast<std::size_t>(pi.table)].by_target)
-                    reads |= 1ull << plan_.tables[static_cast<std::size_t>(pi.table)].index_reg;
+                if (pi.table >= 0 && !plan_.tables[static_cast<std::size_t>(pi.table)].by_target) {
+                    const auto& tbl = plan_.tables[static_cast<std::size_t>(pi.table)];
+                    reads |= 1ull << tbl.index_reg;
+                    if (tbl.table_reg >= 0) reads |= 1ull << static_cast<unsigned>(tbl.table_reg);
+                }
                 const std::uint64_t writes =
                     static_cast<std::uint64_t>(pi.writes) | (static_cast<std::uint64_t>(pi.vwrites) << 32);
                 const std::uint64_t dirty =
@@ -877,12 +880,12 @@ std::uint32_t RegionEmitter::vpins_dead_at_entry(std::int32_t index) const {
     return dead;
 }
 
-void RegionEmitter::exit_pins(std::uint64_t dirty, bool restore) {
+void RegionEmitter::exit_pins(std::uint64_t dirty, bool restore, std::uint32_t skip_restore) {
     flush_pins(dirty & ~static_cast<std::uint64_t>(plan_.globals));
     if (!restore) return;
     const auto& conv = translator_register_convention();
     // Tier 2: lent convention registers are in the context, like evicted ones.
-    for (auto m = plan_.evicted | (plan_.globals & static_cast<std::uint32_t>(lent_)); m; m &= m - 1) {
+    for (auto m = (plan_.evicted | (plan_.globals & static_cast<std::uint32_t>(lent_))) & ~skip_restore; m; m &= m - 1) {
         const auto g = static_cast<unsigned>(std::countr_zero(m));
         a_.mov(64, x64::gp(static_cast<unsigned>(conv.host[g])), gmem(g));
     }
@@ -2411,6 +2414,12 @@ void RegionEmitter::emit_stubs() {
             emit_indirect_jump();
             break;
         case Stub::K::indirect_exit:
+            if (s.target >= 0) {
+                const auto v = val(static_cast<unsigned>(s.target));
+                if (v.is_reg()) a_.mov(64, Gp::rcx, v.r);
+                else if (v.is_zero()) a_.mov_imm(Gp::rcx, 0);
+                else a_.mov(64, Gp::rcx, gmem(v.g));
+            }
             exit_pins(s.dirty);
             emit_indirect_jump();
             break;
@@ -2845,13 +2854,34 @@ void RegionEmitter::note_vec_broadcast(unsigned index, unsigned es) {
     if (index >= 32) return;
     bool written = ((vwritten_ >> index) & 1u) != 0;
     for (unsigned i = 0; i < pending_vec_count_ && !written; ++i) written = pending_vec_[i].guest == index;
-    if (!written) return;
+    if (!written && !(cur_ && ((cur_->vwrites >> index) & 1u))) return;
     if (es == 32) {
         vdup32_ |= 1u << index;
         vdup64_ |= 1u << index;
     } else if (es == 64) {
         vdup64_ |= 1u << index;
     }
+}
+
+bool RegionEmitter::vec_only_lane0_before_fsqrt(unsigned index, unsigned es) const {
+    if (index >= 32 || (es != 32 && es != 64) || !cpu_features().avx2) return false;
+    const std::uint32_t want_sqrt = es == 32 ? 0x6ea1f800u : 0x6ee1f800u;
+    const auto bit = 1u << index;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 8; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader || pj.flow != Flow::normal || pj.may_fault || pj.conservative_writes || pj.inline_call ||
+            pj.inline_ret)
+            return false;
+        if (pj.vreads & bit) {
+            const std::uint32_t w = plan_.words[static_cast<std::size_t>(j)];
+            if ((w & 0xfffffc00u) != want_sqrt) return false;
+            const unsigned rn = (w >> 5) & 31u, rd = w & 31u;
+            return rn == index && rd == index;
+        }
+        if (pj.vwrites & bit) return false;
+    }
+    return false;
 }
 
 // ---- p3: zero-above facts across labels (Plan::vzero_join) -------------------------------------

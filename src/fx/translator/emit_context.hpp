@@ -181,6 +181,15 @@ public:
         (void)index;
         (void)es;
     }
+    // True when `index`'s next use on a straight-line non-faulting path is a
+    // 128-bit FSQRT.4S/.2D that consumes only lane 0 via vec_broadcast (and
+    // overwrites `index` or leaves it dead after), so an in-place DUP.4S/.2D
+    // from lane 0 can be elided while still setting vec_broadcast.
+    [[nodiscard]] virtual bool vec_only_lane0_before_fsqrt(unsigned index, unsigned es) const {
+        (void)index;
+        (void)es;
+        return false;
+    }
 
     // ---- source operands without a scratch register (added by translator
     // core; additive) ----------------------------------------------------------

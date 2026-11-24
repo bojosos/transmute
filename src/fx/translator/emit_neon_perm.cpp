@@ -110,6 +110,11 @@ unsigned emit_copy(EmitContext& ctx, std::uint32_t w) {
         if (size == 3 && !q) return 0;
         V v(ctx);
         if (q) {   // broadcast straight from memory when Vn is there
+            if ((size == 2 || size == 3) && index == 0 && rd == rn && v.avx2 &&
+                ctx.vec_only_lane0_before_fsqrt(rd, size == 2 ? 32u : 64u)) {
+                ctx.note_vec_broadcast(rd, size == 2 ? 32u : 64u);
+                return 1;
+            }
             const Src n = dup_source(v, size, element_source(ctx, rn, size));
             const Xmm d = ctx.write_vec(rd);
             dup_element(v, size, d, n, index);

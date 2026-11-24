@@ -246,9 +246,16 @@ void RegionEmitter::e_call(const PlanInst& pi) {
         flags_ = FlagsState::ctx;
     }
     // x30 = return pc. Plan::cold_layout: straight into x30's pin (the RSB
-    // push stores it from there), else through rdx.
+    // push stores it from there), else through rdx. When x30 is an evicted or
+    // lent convention register (not hw_rsb), exit_pins skips reloading gmem(30)
+    // and we materialize return_pc directly into x30's convention host, saving
+    // both the gmem(30) store and the store-forwarding stall on reload.
+    const bool x30_evicted = !hw_rsb && !pinned(30) &&
+                             ((plan_.evicted | (plan_.globals & static_cast<std::uint32_t>(lent_))) & (1u << 30)) != 0;
     Gp ret_reg = Gp::rdx;
-    if (plan_.cold_layout && pinned(30)) {
+    if (x30_evicted) {
+        // Materialized into conv.host[30] right after exit_pins below.
+    } else if (plan_.cold_layout && pinned(30)) {
         ret_reg = pin(30);
         fixup_imm64(ret_reg, return_pc);
     } else {
@@ -335,8 +342,15 @@ void RegionEmitter::e_call(const PlanInst& pi) {
         if (!cont_follows) a_.jmp(cont_host());
         return;
     }
-    rsb_push(return_pc, pi.continuation, ret_reg);
-    exit_pins(current_dirty());
+    if (x30_evicted) {
+        exit_pins(current_dirty(), true, 1u << 30);
+        const Gp conv_x30 = x64::gp(static_cast<unsigned>(translator_register_convention().host[30]));
+        fixup_imm64(conv_x30, return_pc);
+        rsb_push(return_pc, pi.continuation, conv_x30);
+    } else {
+        rsb_push(return_pc, pi.continuation, ret_reg);
+        exit_pins(current_dirty());
+    }
     if (indirect) {
         if (pi.shadow_base >= 0) {
             // After exit_pins: convention globals are in their convention hosts
@@ -417,11 +431,33 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     if (direct_bounded) {
         // Proven immutable image code + straight-line bound check: wI < count
         // and every table target is exact, so dispatch directly through a dense
-        // 4-byte host offset table with no bounds/target check or fallback.
+        // 4-byte host offset table. If the table pointer was hoisted before a
+        // loop (t.table_reg >= 0), guard it with one compare against table_addr
+        // so the host table load runs in parallel with the guest table load.
+        x64::Label generic{};
+        if (t.table_reg >= 0) {
+            generic = cold ? add_stub(Stub::K::indirect_exit, FlagsState::ctx, dirty, 0,
+                                      static_cast<std::int32_t>(pi.inst.rn))
+                           : a_.new_label();
+            fixup_imm64(Gp::rax, t.table_addr);
+            const auto tv = val(static_cast<unsigned>(t.table_reg));
+            if (tv.is_reg()) a_.cmp(64, tv.r, Gp::rax);
+            else a_.cmp(64, Gp::rax, gmem(tv.g));
+            a_.jcc(Cond::ne, generic);
+        }
         a_.lea(64, Gp::r8, x64::rip(ht.label));
         a_.movsx(64, Gp::r9, ptr(Gp::r8, Gp::rdx, 4), 32);
         a_.add(64, Gp::r9, Gp::r8);
         a_.jmp(Gp::r9);
+        if (t.table_reg >= 0 && !cold) {
+            a_.bind(generic);
+            const auto v = val(pi.inst.rn);
+            if (v.is_reg()) a_.mov(64, Gp::rcx, v.r);
+            else if (v.is_zero()) a_.mov_imm(Gp::rcx, 0);
+            else a_.mov(64, Gp::rcx, gmem(v.g));
+            exit_pins(dirty);
+            emit_indirect_jump();
+        }
         ht.entries.resize(t.count);
         for (std::uint32_t k = 0; k < t.count; ++k) {
             const auto pc = plan_.table_pcs[t.first + k];
@@ -655,7 +691,12 @@ void RegionEmitter::e_indirect(const PlanInst& pi) {
     }
     materialize_state(flags_, false, true);   // a region exit: the raw form (region_emitter.cpp)
     flags_ = FlagsState::ctx;
-    exit_pins(current_dirty());
+    const bool x30_ret_evicted = d.kind == Kind::ret && d.rn == 30 && target == Gp::rcx &&
+                                 ((plan_.evicted | (plan_.globals & static_cast<std::uint32_t>(lent_))) & (1u << 30)) != 0;
+    exit_pins(current_dirty(), true, x30_ret_evicted ? (1u << 30) : 0u);
+    if (x30_ret_evicted) {
+        a_.mov(64, x64::gp(static_cast<unsigned>(translator_register_convention().host[30])), Gp::rcx);
+    }
     if (d.kind == Kind::ret) {
         if (use_hw_rsb()) {
             const auto free_mem = ctx_mem(offsetof(GuestContext, hw_rsb_free));
