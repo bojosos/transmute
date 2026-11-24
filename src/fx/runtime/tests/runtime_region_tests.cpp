@@ -1102,6 +1102,55 @@ FX_TEST(host_leaf_gets_its_data) {
     unregister_host_entry(callee);
 }
 
+// register_host_fp_leaf and register_host_stack_probe: fast paths skip adapter/C++
+// call while out-of-range stack probes fall back cleanly to the callback.
+FX_TEST(host_fp_leaf_and_stack_probe) {
+    init();
+    GuestCode code({});
+    const auto fp_callee = code.at(16);
+    const auto probe_callee = code.at(32);
+    CallbackLog fp_log, probe_log;
+    register_host_fp_leaf(fp_callee, &halve_even, &host_callback, &fp_log);
+    const std::uint64_t eight[] = {8}, five[] = {5};
+    FX_CHECK_EQ(call_guest(fp_callee, eight), 4u);
+    FX_CHECK_EQ(fp_log.calls, 0);
+    FX_CHECK_EQ(call_guest(fp_callee, five), 16u);   // fallback: 5 * 3 + 1
+    FX_CHECK_EQ(fp_log.calls, 1);
+    unregister_host_entry(fp_callee);
+
+    // Stack probe: inline x64 checks x[9] (uint32_t) against [guest_stack_limit, guest_stack_base].
+    register_host_stack_probe(probe_callee, &host_callback, &probe_log);
+    GuestContext& ctx = ensure_thread_context();
+    const auto saved_base = ctx.guest_stack_base, saved_limit = ctx.guest_stack_limit, saved_sp = ctx.x[31];
+    ctx.guest_stack_base = 0x100000;
+    ctx.guest_stack_limit = 0x0f0000;
+    const auto run_probe = [&](std::uint64_t sp, std::uint64_t size) {
+        ctx.x[0] = 7;
+        ctx.x[9] = size;
+        ctx.x[31] = sp;
+        call_guest_prepared(ctx, probe_callee);
+    };
+    run_probe(0x0ff000, 4096);                    // in range -> inline fast path (x0 unchanged, no callback)
+    FX_CHECK_EQ(probe_log.calls, 0);
+    FX_CHECK_EQ(ctx.x[0], 7u);
+    run_probe(0x0ff000, 0x1234000000001000ULL);   // high 32 bits of x9 ignored (uint32_t size = 4096) -> fast path
+    FX_CHECK_EQ(probe_log.calls, 0);
+    FX_CHECK_EQ(ctx.x[0], 7u);
+    run_probe(0x0f0800, 4096);                    // sp - size < limit -> fallback callback (x0 = 7*3+1 = 22)
+    FX_CHECK_EQ(probe_log.calls, 1);
+    FX_CHECK_EQ(ctx.x[0], 22u);
+    run_probe(0x101000, 16);                      // sp > base -> fallback callback
+    FX_CHECK_EQ(probe_log.calls, 2);
+    FX_CHECK_EQ(ctx.x[0], 22u);
+    run_probe(0x000100, 4096);                    // size > sp -> fallback callback
+    FX_CHECK_EQ(probe_log.calls, 3);
+    FX_CHECK_EQ(ctx.x[0], 22u);
+    ctx.guest_stack_base = saved_base;
+    ctx.guest_stack_limit = saved_limit;
+    ctx.x[31] = saved_sp;
+    unregister_host_entry(probe_callee);
+}
+
 // ---- process exit ---------------------------------------------------------------------------------
 // Keep last: runtime_prepare_exit stops the preloaders for good.
 

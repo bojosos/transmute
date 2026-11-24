@@ -1707,19 +1707,27 @@ bool signbit_fast(R value) noexcept {
     else return (std::bit_cast<std::uint64_t>(value) >> 63) != 0;
 }
 
+#if defined(_MSC_VER)
+#define ALCHEMY_FORCEINLINE __forceinline
+#else
+#define ALCHEMY_FORCEINLINE __attribute__((always_inline)) inline
+#endif
+
 // Single-precision trig/inverse-trig fast paths computed in IEEE double
 // precision (error < 1e-11 -> correctly rounded to <= 0.501 ULP in binary32),
-// avoiding slow ucrtbase.dll DLL calls and double range reductions in
-// ___sincosf_stret / sinf / cosf / atan2f / acosf / atanf. True leaf functions
-// (zero CRT calls on the fast path -> zero stack spills on Win64).
-inline bool fast_sincosf_core(float xf, float& s_out, float& c_out) noexcept {
-    if (xf == 0.0f) {
-        s_out = xf;   // preserve -0.0f
-        c_out = 1.0f;
-        return true;
-    }
+// avoiding slow ucrtbase.dll DLL calls, double range reductions, and branch
+// mispredictions on random inputs in ___sincosf_stret / sinf / cosf / atan2f /
+// acosf / asinf / atanf. True leaf functions (zero CRT calls on the fast path).
+struct SincosfResult {
+    float s;
+    float c;
+    bool ok;
+};
+
+ALCHEMY_FORCEINLINE SincosfResult fast_sincosf_core(float xf) noexcept {
+    if (xf == 0.0f) return {xf, 1.0f, true};   // preserve -0.0f
+    if ((std::bit_cast<std::uint32_t>(xf) & 0x7fffffffu) > 0x49742400u) return {0.0f, 0.0f, false};   // |xf| > 1e6
     const double x = static_cast<double>(xf);
-    if (std::fabs(x) > 1.0e6) return false;
     // 3-part Cody-Waite split of pi/2: top two parts have 20 trailing zero
     // mantissa bits so kd * kPi2_1 and kd * kPi2_2 are exact for all |k| < 2^20.
     constexpr double kInvPiOver2 = 0.636619772367581343075535053490057448;
@@ -1729,22 +1737,42 @@ inline bool fast_sincosf_core(float xf, float& s_out, float& c_out) noexcept {
 #if defined(_M_X64) || defined(__x86_64__)
     const int k = _mm_cvtsd_si32(_mm_set_sd(x * kInvPiOver2));
     const double kd = static_cast<double>(k);
+    const double r = ((x - kd * kPi2_1) - kd * kPi2_2) - kd * kPi2_3;
+    // Packed 2-wide SSE2 Estrin evaluation: lane 0 = sin(r), lane 1 = cos(r),
+    // followed by branchless quadrant swap and sign flip.
+    const __m128d vr2 = _mm_set1_pd(r * r);
+    const __m128d vr4 = _mm_mul_pd(vr2, vr2);
+    const __m128d vr8 = _mm_mul_pd(vr4, vr4);
+    const __m128d a = _mm_add_pd(_mm_set_pd(-5.00000000000000000000e-01, -1.66666666666666657415e-01),
+                                 _mm_mul_pd(vr2, _mm_set_pd(4.16666666666666643537e-02, 8.33333333333333321769e-03)));
+    const __m128d b = _mm_add_pd(_mm_set_pd(-1.38888888888888894190e-03, -1.98412698412698412525e-04),
+                                 _mm_mul_pd(vr2, _mm_set_pd(2.48015873015873015657e-05, 2.75573192239858925106e-06)));
+    const __m128d c = _mm_mul_pd(vr8, _mm_set_pd(-2.75573192239858882745e-07, -2.50521083854417202247e-08));
+    const __m128d poly = _mm_add_pd(_mm_add_pd(a, _mm_mul_pd(vr4, b)), c);
+    const __m128d base = _mm_set_pd(1.0, r);
+    const __m128d vsc = _mm_add_pd(base, _mm_mul_pd(_mm_mul_pd(base, vr2), poly));   // [lo=sn, hi=cs]
+    const auto ku = static_cast<unsigned>(k);
+    const __m128d vswapped = _mm_shuffle_pd(vsc, vsc, 1);   // [lo=cs, hi=sn]
+    const __m128d odd_mask = _mm_castsi128_pd(_mm_set1_epi64x(-static_cast<std::int64_t>(ku & 1u)));
+    const __m128d vmag = _mm_or_pd(_mm_and_pd(odd_mask, vswapped), _mm_andnot_pd(odd_mask, vsc));
+    const auto s_sign = static_cast<std::int64_t>(static_cast<std::uint64_t>(ku & 2u) << 62);
+    const auto c_sign = static_cast<std::int64_t>(static_cast<std::uint64_t>((ku + 1u) & 2u) << 62);
+    const __m128d vsign = _mm_castsi128_pd(_mm_set_epi64x(c_sign, s_sign));
+    const __m128 vf = _mm_cvtpd_ps(_mm_xor_pd(vmag, vsign));
+    const auto bits = static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castps_si128(vf)));
+    return {std::bit_cast<float>(static_cast<std::uint32_t>(bits)),
+            std::bit_cast<float>(static_cast<std::uint32_t>(bits >> 32)), true};
 #else
     const double kd = std::rint(x * kInvPiOver2);
     const auto k = static_cast<int>(kd);
-#endif
     const double r = ((x - kd * kPi2_1) - kd * kPi2_2) - kd * kPi2_3;
-    const double r2 = r * r;
-    const double sn = r + r * r2 * (-1.66666666666666657415e-01 +
-                                    r2 * (8.33333333333333321769e-03 +
-                                          r2 * (-1.98412698412698412525e-04 +
-                                                r2 * (2.75573192239858925106e-06 +
-                                                      r2 * (-2.50521083854417202247e-08)))));
-    const double cs = 1.0 + r2 * (-5.00000000000000000000e-01 +
-                                  r2 * (4.16666666666666643537e-02 +
-                                        r2 * (-1.38888888888888894190e-03 +
-                                              r2 * (2.48015873015873015657e-05 +
-                                                    r2 * (-2.75573192239858882745e-07)))));
+    const double r2 = r * r, r4 = r2 * r2, r8 = r4 * r4;
+    const double sn = r + (r * r2) * ((-1.66666666666666657415e-01 + r2 * 8.33333333333333321769e-03) +
+                                      r4 * (-1.98412698412698412525e-04 + r2 * 2.75573192239858925106e-06) +
+                                      r8 * (-2.50521083854417202247e-08));
+    const double cs = 1.0 + r2 * ((-5.00000000000000000000e-01 + r2 * 4.16666666666666643537e-02) +
+                                  r4 * (-1.38888888888888894190e-03 + r2 * 2.48015873015873015657e-05) +
+                                  r8 * (-2.75573192239858882745e-07));
     double s = sn, c = cs;
     switch (static_cast<unsigned>(k) & 3u) {
     case 0: break;
@@ -1752,17 +1780,34 @@ inline bool fast_sincosf_core(float xf, float& s_out, float& c_out) noexcept {
     case 2: s = -sn; c = -cs; break;
     default: s = -cs; c = sn; break;
     }
-    s_out = static_cast<float>(s);
-    c_out = static_cast<float>(c);
-    return true;
+    return {static_cast<float>(s), static_cast<float>(c), true};
+#endif
 }
 
-// atan(z) for z in [0, 1] in double precision (error < 2e-11).
-inline double fast_atan_unit(double z) noexcept {
+// atan(z) for z in [0, 1] in double precision (error < 2e-11), branchless Estrin.
+ALCHEMY_FORCEINLINE double fast_atan_unit(double z) noexcept {
     constexpr double kTanPi12 = 0.26794919243112270647;   // 2 - sqrt(3)
     constexpr double kSqrt3 = 1.73205080756887729353;
     constexpr double kPi6 = 0.52359877559829887308;
     constexpr double kPi4 = 0.78539816339744830962;
+#if defined(_M_X64) || defined(__x86_64__)
+    const __m128d vz = _mm_set_sd(z);
+    const __m128d m1 = _mm_cmpgt_sd(vz, _mm_set_sd(kTanPi12));
+    const __m128d m2 = _mm_cmpgt_sd(vz, _mm_set_sd(0.66));
+    const __m128d vone = _mm_set_sd(1.0);
+    const __m128d vs3 = _mm_set_sd(kSqrt3);
+    const __m128d n1 = _mm_sub_sd(_mm_mul_sd(vz, vs3), vone);
+    const __m128d d1 = _mm_add_sd(vz, vs3);
+    const __m128d n2 = _mm_sub_sd(vz, vone);
+    const __m128d d2 = _mm_add_sd(vz, vone);
+    const __m128d num01 = _mm_or_pd(_mm_and_pd(m1, n1), _mm_andnot_pd(m1, vz));
+    const __m128d den01 = _mm_or_pd(_mm_and_pd(m1, d1), _mm_andnot_pd(m1, vone));
+    const __m128d off01 = _mm_and_pd(m1, _mm_set_sd(kPi6));
+    const __m128d num = _mm_or_pd(_mm_and_pd(m2, n2), _mm_andnot_pd(m2, num01));
+    const __m128d den = _mm_or_pd(_mm_and_pd(m2, d2), _mm_andnot_pd(m2, den01));
+    const double off = _mm_cvtsd_f64(_mm_or_pd(_mm_and_pd(m2, _mm_set_sd(kPi4)), _mm_andnot_pd(m2, off01)));
+    const double t = _mm_cvtsd_f64(_mm_div_sd(num, den));
+#else
     double t = z;
     double off = 0.0;
     if (z > 0.66) {
@@ -1772,19 +1817,19 @@ inline double fast_atan_unit(double z) noexcept {
         t = (z * kSqrt3 - 1.0) / (z + kSqrt3);
         off = kPi6;
     }
-    // |t| <= 0.26795 -> degree-15 Taylor has max error < 2e-11.
+#endif
+    // |t| <= 0.26795 -> degree-15 Taylor has max error < 2e-11 (3-level Estrin).
     const double u = t * t;
-    const double p = t + t * u * (-1.0 / 3.0 +
-                                  u * (1.0 / 5.0 +
-                                       u * (-1.0 / 7.0 +
-                                            u * (1.0 / 9.0 +
-                                                 u * (-1.0 / 11.0 +
-                                                      u * (1.0 / 13.0 +
-                                                           u * (-1.0 / 15.0)))))));
-    return off + p;
+    const double u2 = u * u;
+    const double u4 = u2 * u2;
+    const double p0 = (-1.0 / 3.0) + u * (1.0 / 5.0);
+    const double p1 = (-1.0 / 7.0) + u * (1.0 / 9.0);
+    const double p2 = (-1.0 / 11.0) + u * (1.0 / 13.0);
+    const double poly = (p0 + u2 * p1) + u4 * (p2 + u2 * (-1.0 / 15.0));
+    return off + t + (t * u) * poly;
 }
 
-inline float fast_atanf_core(float xf) noexcept {
+ALCHEMY_FORCEINLINE float fast_atanf_core(float xf) noexcept {
     if (xf == 0.0f) return xf;
     const double ax = std::fabs(static_cast<double>(xf));
     constexpr double kPi2 = 1.57079632679489661923;
@@ -1792,7 +1837,7 @@ inline float fast_atanf_core(float xf) noexcept {
     return static_cast<float>(signbit_fast(xf) ? -a : a);
 }
 
-inline float fast_atan2f_core(float yf, float xf) noexcept {
+ALCHEMY_FORCEINLINE float fast_atan2f_core(float yf, float xf) noexcept {
     constexpr double kPi = 3.14159265358979323846;
     constexpr double kPi2 = 1.57079632679489661923;
     if (yf == 0.0f) {
@@ -1800,24 +1845,112 @@ inline float fast_atan2f_core(float yf, float xf) noexcept {
         return yf;   // preserves +-0.0f
     }
     if (xf == 0.0f) return signbit_fast(yf) ? static_cast<float>(-kPi2) : static_cast<float>(kPi2);
+#if defined(_M_X64) || defined(__x86_64__)
+    const __m128d vsign = _mm_set_sd(-0.0);
+    const __m128d vy = _mm_set_sd(static_cast<double>(yf));
+    const __m128d vx = _mm_set_sd(static_cast<double>(xf));
+    const __m128d vay = _mm_andnot_pd(vsign, vy);
+    const __m128d vax = _mm_andnot_pd(vsign, vx);
+    const __m128d vswap = _mm_cmpgt_sd(vay, vax);
+    const __m128d vz = _mm_div_sd(_mm_min_sd(vay, vax), _mm_max_sd(vay, vax));
+    const __m128d va0 = _mm_set_sd(fast_atan_unit(_mm_cvtsd_f64(vz)));
+    const __m128d va1 = _mm_or_pd(_mm_and_pd(vswap, _mm_sub_sd(_mm_set_sd(kPi2), va0)), _mm_andnot_pd(vswap, va0));
+    const __m128d vxneg = _mm_cmplt_sd(vx, _mm_setzero_pd());
+    const __m128d va2 = _mm_or_pd(_mm_and_pd(vxneg, _mm_sub_sd(_mm_set_sd(kPi), va1)), _mm_andnot_pd(vxneg, va1));
+    const __m128d vres = _mm_xor_pd(va2, _mm_and_pd(vy, vsign));
+    return static_cast<float>(_mm_cvtsd_f64(vres));
+#else
     const double ay = std::fabs(static_cast<double>(yf));
     const double ax = std::fabs(static_cast<double>(xf));
     double a = ay <= ax ? fast_atan_unit(ay / ax) : (kPi2 - fast_atan_unit(ax / ay));
     if (xf < 0.0f) a = kPi - a;
     return static_cast<float>(yf < 0.0f ? -a : a);
+#endif
 }
 
-inline float fast_acosf_core(float xf) noexcept {
-    if (xf == 1.0f) return 0.0f;
-    if (xf == -1.0f) return 3.14159265358979323846f;
-    if (xf == 0.0f) return 1.57079632679489661923f;
+// asin(u) for u in [0, 0.5] in double precision (error < 5e-11), division-free
+// packed SSE2 Estrin evaluation of the degree-25 Taylor series.
+ALCHEMY_FORCEINLINE double fast_asin_half(double u) noexcept {
+    constexpr double a1 = 1.0 / 6.0;
+    constexpr double a2 = 3.0 / 40.0;
+    constexpr double a3 = 5.0 / 112.0;
+    constexpr double a4 = 35.0 / 1152.0;
+    constexpr double a5 = 63.0 / 2816.0;
+    constexpr double a6 = 231.0 / 13312.0;
+    constexpr double a7 = 143.0 / 10240.0;
+    constexpr double a8 = 6435.0 / 557056.0;
+    constexpr double a9 = 12155.0 / 1245184.0;
+    constexpr double a10 = 46189.0 / 5505024.0;
+    constexpr double a11 = 88179.0 / 12058624.0;
+    constexpr double a12 = 676039.0 / 104857600.0;
+    const double w = u * u;
+#if defined(_M_X64) || defined(__x86_64__)
+    const __m128d vw2 = _mm_set1_pd(w * w);
+    const __m128d vw4 = _mm_mul_pd(vw2, vw2);
+    const __m128d vw8 = _mm_mul_pd(vw4, vw4);
+    const __m128d p0 = _mm_add_pd(_mm_set_pd(a2, a1), _mm_mul_pd(vw2, _mm_set_pd(a4, a3)));
+    const __m128d p1 = _mm_add_pd(_mm_set_pd(a6, a5), _mm_mul_pd(vw2, _mm_set_pd(a8, a7)));
+    const __m128d p2 = _mm_add_pd(_mm_set_pd(a10, a9), _mm_mul_pd(vw2, _mm_set_pd(a12, a11)));
+    const __m128d vsum = _mm_add_pd(_mm_add_pd(p0, _mm_mul_pd(vw4, p1)), _mm_mul_pd(vw8, p2));
+    const double poly = _mm_cvtsd_f64(vsum) + w * _mm_cvtsd_f64(_mm_unpackhi_pd(vsum, vsum));
+#else
+    const double w2 = w * w, w4 = w2 * w2, w8 = w4 * w4;
+    const double even = (a1 + w2 * a3) + w4 * (a5 + w2 * a7) + w8 * (a9 + w2 * a11);
+    const double odd = (a2 + w2 * a4) + w4 * (a6 + w2 * a8) + w8 * (a10 + w2 * a12);
+    const double poly = even + w * odd;
+#endif
+    return u + (u * w) * poly;
+}
+
+ALCHEMY_FORCEINLINE float fast_acosf_core(float xf) noexcept {
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kPi2 = 1.57079632679489661923;
+#if defined(_M_X64) || defined(__x86_64__)
+    const __m128d vx = _mm_set_sd(static_cast<double>(xf));
+    const __m128d vsign = _mm_set_sd(-0.0);
+    const __m128d vax = _mm_andnot_pd(vsign, vx);
+    const __m128d vhi = _mm_cmpgt_sd(vax, _mm_set_sd(0.5));
+    const __m128d vneg = _mm_cmplt_sd(vx, _mm_setzero_pd());
+    const __m128d vsqrt = _mm_sqrt_sd(_mm_setzero_pd(), _mm_mul_sd(_mm_set_sd(0.5), _mm_sub_sd(_mm_set_sd(1.0), vax)));
+    const __m128d vu = _mm_or_pd(_mm_and_pd(vhi, vsqrt), _mm_andnot_pd(vhi, vax));
+    const double a = fast_asin_half(_mm_cvtsd_f64(vu));
+    const __m128d voff_hi = _mm_and_pd(vneg, _mm_set_sd(kPi));
+    const __m128d voff = _mm_or_pd(_mm_and_pd(vhi, voff_hi), _mm_andnot_pd(vhi, _mm_set_sd(kPi2)));
+    const __m128d vscale_lo = _mm_xor_pd(_mm_set_sd(-1.0), _mm_and_pd(vneg, vsign));
+    const __m128d vscale_hi = _mm_xor_pd(_mm_set_sd(2.0), _mm_and_pd(vneg, vsign));
+    const __m128d vscale = _mm_or_pd(_mm_and_pd(vhi, vscale_hi), _mm_andnot_pd(vhi, vscale_lo));
+    return static_cast<float>(_mm_cvtsd_f64(_mm_add_sd(voff, _mm_mul_sd(vscale, _mm_set_sd(a)))));
+#else
     const double x = static_cast<double>(xf);
-    if (x > 0.0) {
-        const double z = std::sqrt((1.0 - x) / (1.0 + x));   // in (0, 1)
-        return static_cast<float>(2.0 * fast_atan_unit(z));
+    const double ax = std::fabs(x);
+    if (ax <= 0.5) {
+        const double a = fast_asin_half(ax);
+        return static_cast<float>(x < 0.0 ? (kPi2 + a) : (kPi2 - a));
     }
-    const double z = std::sqrt((1.0 + x) / (1.0 - x));       // in (0, 1)
-    return static_cast<float>(3.14159265358979323846 - 2.0 * fast_atan_unit(z));
+    const double a = 2.0 * fast_asin_half(std::sqrt(0.5 * (1.0 - ax)));
+    return static_cast<float>(x < 0.0 ? (kPi - a) : a);
+#endif
+}
+
+ALCHEMY_FORCEINLINE float fast_asinf_core(float xf) noexcept {
+    if (xf == 0.0f) return xf;   // preserve -0.0f
+    constexpr double kPi2 = 1.57079632679489661923;
+#if defined(_M_X64) || defined(__x86_64__)
+    const __m128d vx = _mm_set_sd(static_cast<double>(xf));
+    const __m128d vsign = _mm_set_sd(-0.0);
+    const __m128d vax = _mm_andnot_pd(vsign, vx);
+    const __m128d vhi = _mm_cmpgt_sd(vax, _mm_set_sd(0.5));
+    const __m128d vsqrt = _mm_sqrt_sd(_mm_setzero_pd(), _mm_mul_sd(_mm_set_sd(0.5), _mm_sub_sd(_mm_set_sd(1.0), vax)));
+    const __m128d vu = _mm_or_pd(_mm_and_pd(vhi, vsqrt), _mm_andnot_pd(vhi, vax));
+    const __m128d va = _mm_set_sd(fast_asin_half(_mm_cvtsd_f64(vu)));
+    const __m128d vmag_hi = _mm_sub_sd(_mm_set_sd(kPi2), _mm_add_sd(va, va));
+    const __m128d vmag = _mm_or_pd(_mm_and_pd(vhi, vmag_hi), _mm_andnot_pd(vhi, va));
+    return static_cast<float>(_mm_cvtsd_f64(_mm_xor_pd(vmag, _mm_and_pd(vx, vsign))));
+#else
+    const double ax = std::fabs(static_cast<double>(xf));
+    const double mag = ax <= 0.5 ? fast_asin_half(ax) : (kPi2 - 2.0 * fast_asin_half(std::sqrt(0.5 * (1.0 - ax))));
+    return static_cast<float>(signbit_fast(xf) ? -mag : mag);
+#endif
 }
 
 template <typename R, R (*Fn)(R)>
@@ -1828,11 +1961,13 @@ FX_GENERATED_ABI bool leaf_trig(fx::GuestContext& ctx) {
     R r;
     if constexpr (sizeof(R) == 4) {
         if constexpr (Fn == static_cast<float (*)(float)>(&std::sin)) {
-            float c{};
-            if (!fast_sincosf_core(x, r, c)) return false;
+            const auto sc = fast_sincosf_core(x);
+            if (!sc.ok) return false;
+            r = sc.s;
         } else if constexpr (Fn == static_cast<float (*)(float)>(&std::cos)) {
-            float s{};
-            if (!fast_sincosf_core(x, s, r)) return false;
+            const auto sc = fast_sincosf_core(x);
+            if (!sc.ok) return false;
+            r = sc.c;
         } else if constexpr (Fn == static_cast<float (*)(float)>(&std::atan)) {
             r = fast_atanf_core(x);
         } else {
@@ -1853,7 +1988,10 @@ FX_GENERATED_ABI bool leaf_sincos_stret(fx::GuestContext& ctx) {
     if (!safe_normal_or_zero(x)) return false;
     R s, c;
     if constexpr (sizeof(R) == 4) {
-        if (!fast_sincosf_core(x, s, c)) return false;
+        const auto sc = fast_sincosf_core(x);
+        if (!sc.ok) return false;
+        s = sc.s;
+        c = sc.c;
     } else {
         s = std::sin(x);
         c = std::cos(x);
@@ -1870,7 +2008,8 @@ FX_GENERATED_ABI bool leaf_asin(fx::GuestContext& ctx) {
     const R x = fp_arg<R>(ctx, 0);
     if (!safe_normal_or_zero(x)) return false;
     if (!(x >= R{-1} && x <= R{1})) return false;
-    fp_ret(ctx, std::asin(x));
+    if constexpr (sizeof(R) == 4) fp_ret(ctx, fast_asinf_core(x));
+    else fp_ret(ctx, std::asin(x));
     return true;
 }
 
@@ -1941,10 +2080,9 @@ FX_GENERATED_ABI bool leaf_atan2(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R y = fp_arg<R>(ctx, 0), x = fp_arg<R>(ctx, 1);
     if (!is_finite_fast(y) || !is_finite_fast(x)) return false;
-    const R r = [&]() -> R {
-        if constexpr (sizeof(R) == 4) return fast_atan2f_core(y, x);
-        else return std::atan2(y, x);
-    }();
+    R r;
+    if constexpr (sizeof(R) == 4) r = fast_atan2f_core(y, x);
+    else r = std::atan2(y, x);
     if (!safe_normal_or_zero(r) || (r == R{0} && y != R{0})) return false;
     fp_ret(ctx, r);
     return true;
@@ -2142,8 +2280,10 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
         return;
     // Leaf fast paths skip the perf frame: with ALCHEMY_PERF every call is counted by its handler.
     fx::HostLeaf leaf = nullptr;
+    bool fp_leaf = false;
     if (!alchemy::perf::enabled()) {
-        if (shared_->leaf[index].load(std::memory_order_relaxed) == kLeafCustom) {
+        const auto kind = shared_->leaf[index].load(std::memory_order_relaxed);
+        if (kind == kLeafCustom) {
             if (const auto found = shared_->custom_leaves.find(pc); found != shared_->custom_leaves.end())
                 fx::register_host_leaf(pc, &custom_leaf_call, &found->second, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
             else fx::register_host_callback(pc, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
@@ -2151,14 +2291,20 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
             shared_->native_entries.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        switch (shared_->leaf[index].load(std::memory_order_relaxed)) {
+        if (kind == kLeafStackProbe) {
+            fx::register_host_stack_probe(pc, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+            shared_->native_entry[index].store(1, std::memory_order_release);
+            shared_->native_entries.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        fp_leaf = kind >= kLeafSincosfStret;
+        switch (kind) {
         case kLeafMemcpy: leaf = &leaf_call<kLeafMemcpy>; break;
         case kLeafBcopy: leaf = &leaf_call<kLeafBcopy>; break;
         case kLeafMemset: leaf = &leaf_call<kLeafMemset>; break;
         case kLeafBzero: leaf = &leaf_call<kLeafBzero>; break;
         case kLeafMemcmp: leaf = &leaf_call<kLeafMemcmp>; break;
         case kLeafStrlen: leaf = &leaf_call<kLeafStrlen>; break;
-        case kLeafStackProbe: leaf = &leaf_call<kLeafStackProbe>; break;
         case kLeafSchedYield: leaf = &leaf_call<kLeafSchedYield>; break;
         case kLeafJitWriteProtect: leaf = &leaf_call<kLeafJitWriteProtect>; break;
         case kLeafJitWriteProtectSupported: leaf = &leaf_call<kLeafJitWriteProtectSupported>; break;
@@ -2214,7 +2360,8 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
         default: break;
         }
     }
-    if (leaf) fx::register_host_leaf(pc, leaf, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+    if (leaf && fp_leaf) fx::register_host_fp_leaf(pc, leaf, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+    else if (leaf) fx::register_host_leaf(pc, leaf, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
     else fx::register_host_callback(pc, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
     shared_->native_entry[index].store(1, std::memory_order_release);
     shared_->native_entries.fetch_add(1, std::memory_order_relaxed);

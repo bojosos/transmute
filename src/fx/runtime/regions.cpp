@@ -2446,24 +2446,68 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
     rt::install_host_entry(guest_pc, host_callback_code(callback, user));
 }
 
-// The leaf entry (process.hpp): entered by jmp from translated code, flushed,
-// with the convention registers live and rsp == ctx->host_rsp, so the leaf is
-// an ordinary Win64 call that keeps them (and the arena's generic unwind
-// entry covers it). It is installed without an adapter; the callback's own
-// entry, behind its adapter, is the fallback.
-//   [mov [x31], sp's host]; lea rcx, [ctx]; mov rax, leaf; call rax; test al, al; jz fallback
-//   interrupt_pending ? pc = x30, exit(interrupt)   (as host_callback_code)
-//   RSB top == x30 ? pop, jmp entry : pc = x30, jmp [stub_indirect_live]
-void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
-    register_host_leaf(guest_pc, reinterpret_cast<HostLeafWithData>(leaf), nullptr, callback, user);   // rdx ignored
+namespace {
+void emit_leaf_return(x64::Assembler& a, int lr_host, x64::Label miss, x64::Label interrupt) {
+    using x64::Gp;
+    using x64::ptr;
+    const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
+    const std::int32_t rsb = ctx_disp(offsetof(GuestContext, rsb));
+    Gp x30 = Gp::r8;   // x30: in its convention host (kept by the call), else its context slot
+    if (lr_host >= 0) x30 = x64::gp(static_cast<unsigned>(lr_host));
+    else a.mov(64, x30, ptr(Gp::r15, x_disp(30)));
+    a.cmp(32, field(offsetof(GuestContext, interrupt_pending)), 0);   // as host_callback_code
+    a.jcc(x64::Cond::ne, interrupt);
+    // Hardware RSB hit only when active (hw_rsb_free < kHwRsbEntries). When
+    // off (the default), fall straight through into the tight byte-wrapped SW
+    // RSB pop with zero taken branches and no redundant host_rsp reload.
+    const x64::Label try_hw_rsb = a.new_label(), sw_rsb = a.new_label(), hw_miss = a.new_label();
+    a.cmp(32, field(offsetof(GuestContext, hw_rsb_free)), static_cast<std::int32_t>(kHwRsbEntries));
+    a.jcc(x64::Cond::b, try_hw_rsb);
+    a.bind(sw_rsb);
+    a.movzx(32, Gp::rax, field(offsetof(GuestContext, rsb_top)), 8);
+    a.alu(x64::Alu::sub, 8, Gp::rax, 1);
+    a.lea(32, Gp::rdx, ptr(Gp::rax, Gp::rax, 1));
+    a.cmp(64, x30, ptr(Gp::r15, Gp::rdx, 8, rsb));
+    a.jcc(x64::Cond::ne, miss);
+    a.mov(8, field(offsetof(GuestContext, rsb_top)), Gp::rax);
+    a.jmp(ptr(Gp::r15, Gp::rdx, 8, rsb + 8));   // the continuation expects the convention registers live
+    a.bind(try_hw_rsb);
+    a.mov(32, Gp::rax, field(offsetof(GuestContext, hw_rsb_free)));
+    a.cmp(64, x30, ptr(Gp::r15, Gp::rax, 8, ctx_disp(offsetof(GuestContext, hw_rsb_guest))));
+    a.jcc_short(x64::Cond::ne, hw_miss);
+    a.lea(32, Gp::rdx, ptr(Gp::rax, 1));
+    a.mov(32, field(offsetof(GuestContext, hw_rsb_free)), Gp::rdx);
+    a.ret();
+    a.bind(hw_miss);
+    a.mov(64, Gp::rsp, field(offsetof(GuestContext, host_rsp)));
+    a.mov(32, field(offsetof(GuestContext, hw_rsb_free)), static_cast<std::int32_t>(kHwRsbEntries));
+    a.jmp(sw_rsb);
+    a.bind(miss);
+    a.mov(64, field(offsetof(GuestContext, pc)), x30);
+    a.jmp(field(offsetof(GuestContext, stub_indirect_live)));
+    a.bind(interrupt);   // live state: stub_dispatch_exit stores the convention registers
+    a.mov(64, field(offsetof(GuestContext, pc)), x30);
+    a.mov(32, field(offsetof(GuestContext, exit_reason)), static_cast<std::int32_t>(ExitReason::interrupt));
+    a.jmp(field(offsetof(GuestContext, stub_dispatch_exit)));
 }
 
-void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, HostCallback callback, void* user) {
+void install_leaf_code(std::uint64_t guest_pc, x64::Assembler& a) {
+    a.finalize();
+    void* code = rt::arena_allocate(a.size(), 16);
+    std::memcpy(code, a.data(), a.size());
+    host::vm::flush_instruction_cache(code, a.size());
+    {
+        rt::ExclusiveLock lock(rt::g.map);
+        rt::g_adapter_code.insert(code);   // live-state code: no adapter
+    }
+    rt::install_host_entry(guest_pc, code);
+}
+
+void register_host_leaf_impl(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, bool has_data,
+                             bool needs_sp, HostCallback callback, void* user) {
     using x64::Gp;
     using x64::ptr;
     rt::ensure_initialized();
-    const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
-    const std::int32_t rsb = ctx_disp(offsetof(GuestContext, rsb));
     const auto& conv = translator_register_convention();
     // x0..x9 in convention hosts (TRANSMUTE_FX_GLOBALS): stored to their slots
     // for the leaf, loaded back after it (its results). A declined leaf
@@ -2475,6 +2519,18 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
             fn(ptr(Gp::r15, x_disp(g)), x64::gp(static_cast<unsigned>(conv.host[g])));
         }
     };
+    // Pick a Win64/ms_abi callee-saved GPR outside the convention to keep rsp
+    // across the call without a stack store/reload store-forwarding stall.
+    std::uint32_t conv_hosts = 0;
+    for (auto m = conv.guest_mask; m; m &= m - 1)
+        conv_hosts |= 1u << static_cast<unsigned>(conv.host[std::countr_zero(m)]);
+    Gp rsp_save = Gp::none;
+    for (const Gp cand : {Gp::r12, Gp::r14, Gp::rbx, Gp::rbp, Gp::r13}) {
+        if (((conv_hosts >> x64::id(cand)) & 1u) == 0) {
+            rsp_save = cand;
+            break;
+        }
+    }
     const void* fallback = host_callback_code(callback, user);
     {
         rt::ExclusiveLock lock(rt::g.map);
@@ -2482,72 +2538,95 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
     }
     const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
     x64::Assembler a(320);
-    const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(),
-                     sw_rsb = a.new_label(), data = a.new_label();
-    if ((conv.guest_mask >> 31) & 1u)   // sp for the leaf (Darwin's stack probe)
+    const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(), data = a.new_label();
+    if (needs_sp && ((conv.guest_mask >> 31) & 1u))
         a.mov(64, ptr(Gp::r15, x_disp(31)), x64::gp(static_cast<unsigned>(conv.host[31])));
     each_argument([&](x64::Mem slot, Gp host) { a.mov(64, slot, host); });
     // Align rsp to 16 bytes + 32-byte shadow space while keeping any HW RSB
     // frames above rsp intact (100% re-entrant).
-    a.mov(64, Gp::rax, Gp::rsp);
-    a.and_(64, Gp::rsp, -16);
-    a.sub(64, Gp::rsp, 48);
-    a.mov(64, ptr(Gp::rsp, 32), Gp::rax);
+    if (rsp_save != Gp::none) {
+        a.mov(64, rsp_save, Gp::rsp);
+        a.and_(64, Gp::rsp, -16);
+        a.sub(64, Gp::rsp, 32);
+    } else {
+        a.mov(64, Gp::rax, Gp::rsp);
+        a.and_(64, Gp::rsp, -16);
+        a.sub(64, Gp::rsp, 48);
+        a.mov(64, ptr(Gp::rsp, 32), Gp::rax);
+    }
     a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
-    a.mov_imm64(Gp::rdx, reinterpret_cast<std::uint64_t>(leaf_data));
+    if (has_data) a.mov_imm64(Gp::rdx, reinterpret_cast<std::uint64_t>(leaf_data));
     a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(leaf));
     a.call(Gp::rax);
-    a.mov(64, Gp::rsp, ptr(Gp::rsp, 32));
+    if (rsp_save != Gp::none) a.mov(64, Gp::rsp, rsp_save);
+    else a.mov(64, Gp::rsp, ptr(Gp::rsp, 32));
     a.test(8, Gp::rax, Gp::rax);
     a.jcc(x64::Cond::e, slow);
     each_argument([&](x64::Mem slot, Gp host) { a.mov(64, host, slot); });
-    Gp x30 = Gp::r8;   // x30: in its convention host (kept by the call), else its context slot
-    if (lr_host >= 0) x30 = x64::gp(static_cast<unsigned>(lr_host));
-    else a.mov(64, x30, ptr(Gp::r15, x_disp(30)));
-    a.cmp(32, field(offsetof(GuestContext, interrupt_pending)), 0);   // as host_callback_code
-    a.jcc(x64::Cond::ne, interrupt);
-    // Hardware RSB hit first (translated BL/BLR callers): paired x64 ret.
-    a.mov(32, Gp::rax, field(offsetof(GuestContext, hw_rsb_free)));
-    a.cmp(32, Gp::rax, static_cast<std::int32_t>(kHwRsbEntries));
-    a.jcc_short(x64::Cond::ae, sw_rsb);
-    a.cmp(64, x30, ptr(Gp::r15, Gp::rax, 8, ctx_disp(offsetof(GuestContext, hw_rsb_guest))));
-    a.jcc_short(x64::Cond::ne, sw_rsb);
-    a.lea(32, Gp::rdx, ptr(Gp::rax, 1));
-    a.mov(32, field(offsetof(GuestContext, hw_rsb_free)), Gp::rdx);
-    a.ret();
-    a.bind(sw_rsb);
-    a.mov(64, Gp::rsp, field(offsetof(GuestContext, host_rsp)));
-    a.mov(32, field(offsetof(GuestContext, hw_rsb_free)), static_cast<std::int32_t>(kHwRsbEntries));
-    a.mov(32, Gp::rax, field(offsetof(GuestContext, rsb_top)));
-    a.sub(32, Gp::rax, 1);
-    a.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
-    a.mov(32, Gp::rdx, Gp::rax);
-    a.shl(32, Gp::rdx, 4);
-    a.cmp(64, x30, ptr(Gp::r15, Gp::rdx, 1, rsb));
-    a.jcc(x64::Cond::ne, miss);
-    a.mov(32, field(offsetof(GuestContext, rsb_top)), Gp::rax);
-    a.jmp(ptr(Gp::r15, Gp::rdx, 1, rsb + 8));   // the continuation expects the convention registers live
-    a.bind(miss);
-    a.mov(64, field(offsetof(GuestContext, pc)), x30);
-    a.jmp(field(offsetof(GuestContext, stub_indirect_live)));
-    a.bind(interrupt);   // live state: stub_dispatch_exit stores the convention registers
-    a.mov(64, field(offsetof(GuestContext, pc)), x30);
-    a.mov(32, field(offsetof(GuestContext, exit_reason)), static_cast<std::int32_t>(ExitReason::interrupt));
-    a.jmp(field(offsetof(GuestContext, stub_dispatch_exit)));
+    emit_leaf_return(a, lr_host, miss, interrupt);
     a.bind(slow);
     a.jmp(x64::rip(data));
     a.align(8);
     a.bind(data);
     a.dq(reinterpret_cast<std::uint64_t>(fallback));
-    a.finalize();
-    void* code = rt::arena_allocate(a.size(), 16);
-    std::memcpy(code, a.data(), a.size());
-    host::vm::flush_instruction_cache(code, a.size());
+    install_leaf_code(guest_pc, a);
+}
+} // namespace
+
+// The leaf entry (process.hpp): entered by jmp from translated code, flushed,
+// with the convention registers live and rsp == ctx->host_rsp, so the leaf is
+// an ordinary Win64 call that keeps them (and the arena's generic unwind
+// entry covers it). It is installed without an adapter; the callback's own
+// entry, behind its adapter, is the fallback.
+void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
+    register_host_leaf_impl(guest_pc, reinterpret_cast<HostLeafWithData>(leaf), nullptr, false, true, callback, user);
+}
+
+void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, HostCallback callback, void* user) {
+    register_host_leaf_impl(guest_pc, leaf, leaf_data, true, true, callback, user);
+}
+
+void register_host_fp_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
+    register_host_leaf_impl(guest_pc, reinterpret_cast<HostLeafWithData>(leaf), nullptr, false, false, callback, user);
+}
+
+void register_host_stack_probe(std::uint64_t guest_pc, HostCallback callback, void* user) {
+    using x64::Gp;
+    using x64::ptr;
+    rt::ensure_initialized();
+    const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
+    const auto& conv = translator_register_convention();
+    const void* fallback = host_callback_code(callback, user);
     {
         rt::ExclusiveLock lock(rt::g.map);
-        rt::g_adapter_code.insert(code);   // live-state code: no adapter
+        fallback = rt::host_entry_adapter(fallback);
     }
-    rt::install_host_entry(guest_pc, code);
+    const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
+    x64::Assembler a(256);
+    const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(), data = a.new_label();
+    // size = (uint32_t)x[9], sp = x[31].
+    if ((conv.guest_mask >> 9) & 1u)
+        a.mov(32, Gp::rax, x64::gp(static_cast<unsigned>(conv.host[9])));
+    else
+        a.mov(32, Gp::rax, ptr(Gp::r15, x_disp(9)));
+    Gp sp = Gp::rcx;
+    if ((conv.guest_mask >> 31) & 1u) sp = x64::gp(static_cast<unsigned>(conv.host[31]));
+    else a.mov(64, sp, ptr(Gp::r15, x_disp(31)));
+    a.cmp(64, Gp::rax, sp);
+    a.jcc(x64::Cond::a, slow);                                           // size > sp
+    a.cmp(64, sp, field(offsetof(GuestContext, guest_stack_base)));
+    a.jcc(x64::Cond::a, slow);                                           // sp > base
+    a.mov(64, Gp::rdx, sp);
+    a.sub(64, Gp::rdx, Gp::rax);
+    a.cmp(64, Gp::rdx, field(offsetof(GuestContext, guest_stack_limit)));
+    a.jcc(x64::Cond::b, slow);                                           // sp - size < limit
+    emit_leaf_return(a, lr_host, miss, interrupt);
+    a.bind(slow);
+    a.jmp(x64::rip(data));
+    a.align(8);
+    a.bind(data);
+    a.dq(reinterpret_cast<std::uint64_t>(fallback));
+    install_leaf_code(guest_pc, a);
 }
 
 void unregister_host_entry(std::uint64_t guest_pc) {

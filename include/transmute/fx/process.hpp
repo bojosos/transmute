@@ -129,6 +129,13 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback call
 // The same with `leaf_data` passed to the leaf (its second argument).
 using HostLeafWithData = bool (FX_GENERATED_ABI*)(GuestContext& ctx, void* leaf_data);
 void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, HostCallback callback, void* user);
+// (additive) Same as register_host_leaf for pure register/FP leaves that do not
+// read guest sp (x[31]), skipping the sp context store on entry.
+void register_host_fp_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user);
+// (additive) Pure inline x64 fast path for Darwin ___chkstk_darwin: verifies
+// [sp - (uint32_t)x9, sp) lies within [ctx.guest_stack_limit, ctx.guest_stack_base]
+// without leaving translated code or spilling any state; declines to `callback` otherwise.
+void register_host_stack_probe(std::uint64_t guest_pc, HostCallback callback, void* user);
 // Removes a register_host_entry / register_host_callback entry (no-op if
 // `guest_pc` has none). Exits linked to it are unlinked; the next branch to
 // `guest_pc` resolves it again (e.g. translates guest code there).
