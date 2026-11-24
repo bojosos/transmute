@@ -1674,5 +1674,48 @@ FX_TEST(core_wave_q2_ccmp_defer_and_cset_bool_fusion) {
         ctx.x[10] = 0xfeedface11223344ULL;
         FX_CHECK(r.run(cset_bool, ctx, "wave q2 cset bool fusion " + std::to_string(k)));
     }
+
+    // 3. Regression: CCMP (k == true) + B.cond back edge with dirty unpinned
+    //    cached registers and a tier-2 loop-header preset (reproduces Blender
+    //    crash when CCMP's defer_taken bypassed B.cond's pre-branch flush /
+    //    inline edge_cache reconciliation on the CCMP-false path).
+    const std::vector<std::uint32_t> ccmp_loop_dirty = {
+        // Loop header (0): uses 6+ unpinned regs so x10..x14 live in the write-back cache.
+        add_imm(true, false, false, 10, 10, 1),             // 0  add x10, x10, #1
+        add_imm(true, false, false, 11, 11, 2),             // 1  add x11, x11, #2
+        add_imm(true, false, false, 12, 12, 3),             // 2  add x12, x12, #3
+        add_imm(true, false, false, 13, 13, 4),             // 3  add x13, x13, #4
+        add_imm(true, false, false, 14, 14, 5),             // 4  add x14, x14, #5
+        add_imm(true, false, false, 15, 15, 6),             // 5  add x15, x15, #6
+        add_imm(true, true, true, 1, 1, 1),                 // 6  subs x1, x1, #1 (countdown)
+        bcond(0, 7),                                        // 7  b.eq exit (14)
+        // Modify x10..x15 right before CCMP+B.EQ back-edge so dirty flushes /
+        // edge_cache reconciliation are required before jumping back to header (0):
+        add_imm(true, false, false, 10, 10, 10),            // 8  add x10, x10, #10
+        add_imm(true, false, false, 11, 11, 20),            // 9  add x11, x11, #20
+        add_imm(true, false, false, 12, 12, 30),            // 10 add x12, x12, #30
+        add_imm(false, true, true, 2, 31, 0),               // 11 cmp w2, #0
+        ccmp(false, true, false, 3, 1, 2, 4),               // 12 ccmp w2, w3, #4, ne (k=true for b.eq!)
+        bcond(0, -13),                                      // 13 b.eq loop_header (0)
+        // exit (14): fold x10..x15 into x0
+        add_shift(true, false, false, 0, 11, 0, 10, 0),     // 14 add x0, x10, x11
+        add_shift(true, false, false, 0, 12, 0, 0, 0),      // 15 add x0, x0, x12
+        add_shift(true, false, false, 0, 13, 0, 0, 0),      // 16 add x0, x0, x13
+        add_shift(true, false, false, 0, 14, 0, 0, 0),      // 17 add x0, x0, x14
+        add_shift(true, false, false, 0, 15, 0, 0, 0),      // 18 add x0, x0, x15
+    };
+    for (unsigned k = 0; k < 6; ++k) {
+        auto ctx = r.context(0x13200 + k);
+        ctx.x[1] = 4;
+        ctx.x[2] = (k % 3 == 0) ? 0u : (k % 3 == 1) ? 7u : 9u;   // k%3==0 hits CCMP-false back-edge!
+        ctx.x[3] = 7u;
+        ctx.x[10] = 100 + k;
+        ctx.x[11] = 200 + k;
+        ctx.x[12] = 300 + k;
+        ctx.x[13] = 400 + k;
+        ctx.x[14] = 500 + k;
+        ctx.x[15] = 600 + k;
+        FX_CHECK(r.run(ccmp_loop_dirty, ctx, "wave q2 ccmp loop dirty back-edge " + std::to_string(k)));
+    }
     r.machine.options.optimize = saved_opt;
 }

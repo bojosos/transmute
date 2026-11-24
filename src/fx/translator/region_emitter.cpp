@@ -1521,9 +1521,9 @@ Label RegionEmitter::taken_label(std::int32_t taken, FlagsState state) {
         t.leader && s_.cache_slot[static_cast<std::size_t>(taken)] >= 0) {
         const auto& e = s_.cache_snaps[static_cast<std::size_t>(s_.cache_slot[static_cast<std::size_t>(taken)])];
         const bool mat = needs_edge_materialize(taken);
+        if (t.inherit_flags) inherited_[taken] = state;
         if (mat || reconcile_needs_code({gc_, vc_}, e, dead_at(taken)))
             return add_stub(Stub::K::edge, mat ? state : FlagsState::ctx, 0, 0, taken, push_snap());
-        if (t.inherit_flags) inherited_[taken] = state;
         return label_of(taken);
     }
     if (t.leader) edge_cache(taken, true);

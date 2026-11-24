@@ -1684,8 +1684,24 @@ void RegionEmitter::e_ccmp(const Inst& d) {
         const auto& pb = plan_.insts[static_cast<std::size_t>(index_) + 1];
         if (pb.inst.kind == Kind::branch_cond && !pb.leader && pb.pc == cur_->pc + 4 && pb.inst.cond < 14) {
             const bool k = condition_holds(pb.inst.cond, static_cast<std::uint32_t>(d.imms) << 28);
-            if (k) defer_taken = true;
-            else if (pb.fall < 0) defer_ldone = true;
+            if (k) {
+                // lfalse jumps straight to B.cond's taken destination, bypassing
+                // any code between CCMP and B.cond's jcc. Allow only when
+                // B.cond will emit neither alias resolves, nor dirty-cache
+                // flushes, nor inline edge_cache(taken, true) before its jcc.
+                const bool no_pre_flush =
+                    alias_count_ == 0 && galias_count_ == 0 && slot_alias_count_ == 0 &&
+                    ((gc_.dirty | vc_.dirty) == 0 || dirty_crosses_branch(index_ + 1));
+                const bool no_inline_edge =
+                    pb.taken < 0 ||
+                    (pb.taken > index_ + 1 && plan_.insts[static_cast<std::size_t>(pb.taken)].leader &&
+                     lent_at(pb.taken) == lent_ &&
+                     (is_pending_target(pb.taken) || s_.cache_slot[static_cast<std::size_t>(pb.taken)] >= 0));
+                if (no_pre_flush && no_inline_edge) defer_taken = true;
+                else defer_ldone = true;
+            } else if (pb.fall < 0) {
+                defer_ldone = true;
+            }
         }
     }
     if (defer_taken) {
