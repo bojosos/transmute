@@ -1868,7 +1868,8 @@ template <typename R>
 FX_GENERATED_ABI bool leaf_asin(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
-    if (!(x >= R{-1} && x <= R{1}) || !safe_normal_or_zero(x)) return false;
+    if (!safe_normal_or_zero(x)) return false;
+    if (!(x >= R{-1} && x <= R{1})) return false;
     fp_ret(ctx, std::asin(x));
     return true;
 }
@@ -1877,6 +1878,7 @@ template <typename R>
 FX_GENERATED_ABI bool leaf_acos(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
+    if (!is_finite_fast(x)) return false;
     if (!(x >= R{-1} && x <= R{1})) return false;
     if constexpr (sizeof(R) == 4) fp_ret(ctx, fast_acosf_core(x));
     else fp_ret(ctx, std::acos(x));
@@ -1887,6 +1889,7 @@ template <typename R>
 FX_GENERATED_ABI bool leaf_exp(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
+    if (!is_finite_fast(x)) return false;
     if constexpr (sizeof(R) == 4) { if (!(x >= -87.0f && x <= 88.0f)) return false; }
     else { if (!(x >= -708.0 && x <= 709.0)) return false; }
     fp_ret(ctx, std::exp(x));
@@ -1897,6 +1900,7 @@ template <typename R>
 FX_GENERATED_ABI bool leaf_exp2(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
+    if (!is_finite_fast(x)) return false;
     if constexpr (sizeof(R) == 4) { if (!(x >= -125.0f && x <= 127.0f)) return false; }
     else { if (!(x >= -1021.0 && x <= 1023.0)) return false; }
     fp_ret(ctx, std::exp2(x));
@@ -1907,7 +1911,8 @@ template <typename R, R (*Fn)(R)>
 FX_GENERATED_ABI bool leaf_log(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
-    if (!(x > R{0}) || !is_finite_fast(x)) return false;
+    if (!is_finite_fast(x)) return false;
+    if (!(x > R{0})) return false;
     fp_ret(ctx, Fn(x));
     return true;
 }
@@ -1916,7 +1921,8 @@ template <typename R>
 FX_GENERATED_ABI bool leaf_sqrt(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
-    if (!(x >= R{0}) || !is_finite_fast(x)) return false;
+    if (!is_finite_fast(x)) return false;
+    if (!(x >= R{0})) return false;
     fp_ret(ctx, std::sqrt(x));
     return true;
 }
@@ -1939,7 +1945,7 @@ FX_GENERATED_ABI bool leaf_atan2(fx::GuestContext& ctx) {
         if constexpr (sizeof(R) == 4) return fast_atan2f_core(y, x);
         else return std::atan2(y, x);
     }();
-    if ((r == R{0} && y != R{0}) || !safe_normal_or_zero(r)) return false;
+    if (!safe_normal_or_zero(r) || (r == R{0} && y != R{0})) return false;
     fp_ret(ctx, r);
     return true;
 }

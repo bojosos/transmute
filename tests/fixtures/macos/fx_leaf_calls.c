@@ -56,6 +56,19 @@ extern float cosf(float);
 extern float atanf(float);
 extern float atan2f(float, float);
 extern float acosf(float);
+extern double acos(double);
+extern float asinf(float);
+extern double asin(double);
+extern float expf(float);
+extern double exp(double);
+extern float exp2f(float);
+extern double exp2(double);
+extern float logf(float);
+extern double log(double);
+extern float log2f(float);
+extern double log2(double);
+extern float sqrtf(float);
+extern double sqrt(double);
 struct fx_float2 { float sinval; float cosval; };
 extern struct fx_float2 __sincosf_stret(float);
 
@@ -393,13 +406,40 @@ static int threads(void) {
     return ok;
 }
 
-/* ---- 11: single-precision trig/inverse-trig math leaves ---- */
+/* ---- 11: math leaves & quiet-NaN FPSR hygiene ---- */
 static float (*volatile p_sinf)(float) = sinf;
 static float (*volatile p_cosf)(float) = cosf;
 static float (*volatile p_atanf)(float) = atanf;
 static float (*volatile p_atan2f)(float, float) = atan2f;
 static float (*volatile p_acosf)(float) = acosf;
+static double (*volatile p_acos)(double) = acos;
+static float (*volatile p_asinf)(float) = asinf;
+static double (*volatile p_asin)(double) = asin;
+static float (*volatile p_expf)(float) = expf;
+static double (*volatile p_exp)(double) = exp;
+static float (*volatile p_exp2f)(float) = exp2f;
+static double (*volatile p_exp2)(double) = exp2;
+static float (*volatile p_logf)(float) = logf;
+static double (*volatile p_log)(double) = log;
+static float (*volatile p_log2f)(float) = log2f;
+static double (*volatile p_log2)(double) = log2;
+static float (*volatile p_sqrtf)(float) = sqrtf;
+static double (*volatile p_sqrt)(double) = sqrt;
 static struct fx_float2 (*volatile p_sincosf)(float) = __sincosf_stret;
+
+static unsigned long read_fpsr(void) {
+    unsigned long v;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(v));
+    return v;
+}
+static void clear_fpsr(void) {
+    __asm__ volatile("msr fpsr, xzr" ::: "memory");
+}
+static double dfrom(unsigned long u) {
+    union { double d; unsigned long u; } v;
+    v.u = u;
+    return v.d;
+}
 
 static unsigned fbits(float x) {
     union { float f; unsigned u; } v;
@@ -452,6 +492,29 @@ static int math_leaves(void) {
         if (p_sinf(nanv) == p_sinf(nanv) || p_cosf(inf) == p_cosf(inf)) return 0;
         if (p_acosf(1.5f) == p_acosf(1.5f) || p_acosf(-1.5f) == p_acosf(-1.5f)) return 0;
         if (p_atan2f(1.0e-30f, 1.0e30f) != 0.0f) return 0;
+
+        /* Quiet NaN must NEVER raise FPSR.IOC (FE_INVALID) in math leaves or FMAXNM/FMINNM. */
+        {
+            const double dnan = dfrom(0x7ff8000000000000UL);
+            volatile float rf;
+            volatile double rd;
+            clear_fpsr();
+            rf = p_acosf(nanv); rf = p_asinf(nanv); rf = p_expf(nanv); rf = p_exp2f(nanv);
+            rf = p_logf(nanv); rf = p_log2f(nanv); rf = p_sqrtf(nanv);
+            rd = p_acos(dnan); rd = p_asin(dnan); rd = p_exp(dnan); rd = p_exp2(dnan);
+            rd = p_log(dnan); rd = p_log2(dnan); rd = p_sqrt(dnan);
+            (void)rf; (void)rd;
+            if ((read_fpsr() & 1UL) != 0) return 0;
+
+            float f1 = 1.0f, fqn = nanv, fout;
+            double d1 = 1.0, dqn = dnan, dout;
+            clear_fpsr();
+            __asm__ volatile("fmaxnm %s0, %s1, %s2" : "=w"(fout) : "w"(fqn), "w"(f1));
+            __asm__ volatile("fminnm %s0, %s1, %s2" : "=w"(fout) : "w"(f1), "w"(fqn));
+            __asm__ volatile("fmaxnm %d0, %d1, %d2" : "=w"(dout) : "w"(dqn), "w"(d1));
+            __asm__ volatile("fminnm %d0, %d1, %d2" : "=w"(dout) : "w"(d1), "w"(dqn));
+            if (fout != 1.0f || dout != 1.0 || (read_fpsr() & 1UL) != 0) return 0;
+        }
 
         /* Dense sweep checking sin/cos/sincos/atan/atan2/acos identities across all quadrants */
         for (int i = -400; i <= 400; ++i) {
