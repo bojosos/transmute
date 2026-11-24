@@ -84,3 +84,11 @@ void bzero(void* d, unsigned long n) { (void)d; (void)n; }
 int memcmp(const void* x, const void* y, unsigned long n) { (void)x; (void)y; (void)n; return -777; }
 unsigned long strlen(const char* s) { (void)s; return 0; }
 void __chkstk_darwin(void) {}
+/* Single-precision math leaves (fx_leaf_calls). */
+float sinf(float x) { return x; }
+float cosf(float x) { return x; }
+float atanf(float x) { return x; }
+float atan2f(float y, float x) { (void)x; return y; }
+float acosf(float x) { return x; }
+struct fx_float2 { float s; float c; };
+struct fx_float2 __sincosf_stret(float x) { struct fx_float2 r = {x, x}; return r; }

@@ -30,6 +30,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#endif
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1698,12 +1701,146 @@ bool safe_normal_or_zero(R value) noexcept {
     }
 }
 
+template <typename R>
+bool signbit_fast(R value) noexcept {
+    if constexpr (sizeof(R) == 4) return (std::bit_cast<std::uint32_t>(value) >> 31) != 0;
+    else return (std::bit_cast<std::uint64_t>(value) >> 63) != 0;
+}
+
+// Single-precision trig/inverse-trig fast paths computed in IEEE double
+// precision (error < 1e-11 -> correctly rounded to <= 0.501 ULP in binary32),
+// avoiding slow ucrtbase.dll DLL calls and double range reductions in
+// ___sincosf_stret / sinf / cosf / atan2f / acosf / atanf. True leaf functions
+// (zero CRT calls on the fast path -> zero stack spills on Win64).
+inline bool fast_sincosf_core(float xf, float& s_out, float& c_out) noexcept {
+    if (xf == 0.0f) {
+        s_out = xf;   // preserve -0.0f
+        c_out = 1.0f;
+        return true;
+    }
+    const double x = static_cast<double>(xf);
+    if (std::fabs(x) > 1.0e6) return false;
+    // 3-part Cody-Waite split of pi/2: top two parts have 20 trailing zero
+    // mantissa bits so kd * kPi2_1 and kd * kPi2_2 are exact for all |k| < 2^20.
+    constexpr double kInvPiOver2 = 0.636619772367581343075535053490057448;
+    constexpr double kPi2_1 = 1.57079632673412561417e+00;   // 0x3ff921fb54400000
+    constexpr double kPi2_2 = 6.07710050630396597660e-11;   // 0x3dd0b4611a600000
+    constexpr double kPi2_3 = 2.02226624879595063154e-21;   // 0x3ba3198a2e037073
+#if defined(_M_X64) || defined(__x86_64__)
+    const int k = _mm_cvtsd_si32(_mm_set_sd(x * kInvPiOver2));
+    const double kd = static_cast<double>(k);
+#else
+    const double kd = std::rint(x * kInvPiOver2);
+    const auto k = static_cast<int>(kd);
+#endif
+    const double r = ((x - kd * kPi2_1) - kd * kPi2_2) - kd * kPi2_3;
+    const double r2 = r * r;
+    const double sn = r + r * r2 * (-1.66666666666666657415e-01 +
+                                    r2 * (8.33333333333333321769e-03 +
+                                          r2 * (-1.98412698412698412525e-04 +
+                                                r2 * (2.75573192239858925106e-06 +
+                                                      r2 * (-2.50521083854417202247e-08)))));
+    const double cs = 1.0 + r2 * (-5.00000000000000000000e-01 +
+                                  r2 * (4.16666666666666643537e-02 +
+                                        r2 * (-1.38888888888888894190e-03 +
+                                              r2 * (2.48015873015873015657e-05 +
+                                                    r2 * (-2.75573192239858882745e-07)))));
+    double s = sn, c = cs;
+    switch (static_cast<unsigned>(k) & 3u) {
+    case 0: break;
+    case 1: s = cs; c = -sn; break;
+    case 2: s = -sn; c = -cs; break;
+    default: s = -cs; c = sn; break;
+    }
+    s_out = static_cast<float>(s);
+    c_out = static_cast<float>(c);
+    return true;
+}
+
+// atan(z) for z in [0, 1] in double precision (error < 2e-11).
+inline double fast_atan_unit(double z) noexcept {
+    constexpr double kTanPi12 = 0.26794919243112270647;   // 2 - sqrt(3)
+    constexpr double kSqrt3 = 1.73205080756887729353;
+    constexpr double kPi6 = 0.52359877559829887308;
+    constexpr double kPi4 = 0.78539816339744830962;
+    double t = z;
+    double off = 0.0;
+    if (z > 0.66) {
+        t = (z - 1.0) / (z + 1.0);
+        off = kPi4;
+    } else if (z > kTanPi12) {
+        t = (z * kSqrt3 - 1.0) / (z + kSqrt3);
+        off = kPi6;
+    }
+    // |t| <= 0.26795 -> degree-15 Taylor has max error < 2e-11.
+    const double u = t * t;
+    const double p = t + t * u * (-1.0 / 3.0 +
+                                  u * (1.0 / 5.0 +
+                                       u * (-1.0 / 7.0 +
+                                            u * (1.0 / 9.0 +
+                                                 u * (-1.0 / 11.0 +
+                                                      u * (1.0 / 13.0 +
+                                                           u * (-1.0 / 15.0)))))));
+    return off + p;
+}
+
+inline float fast_atanf_core(float xf) noexcept {
+    if (xf == 0.0f) return xf;
+    const double ax = std::fabs(static_cast<double>(xf));
+    constexpr double kPi2 = 1.57079632679489661923;
+    const double a = ax <= 1.0 ? fast_atan_unit(ax) : (kPi2 - fast_atan_unit(1.0 / ax));
+    return static_cast<float>(signbit_fast(xf) ? -a : a);
+}
+
+inline float fast_atan2f_core(float yf, float xf) noexcept {
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kPi2 = 1.57079632679489661923;
+    if (yf == 0.0f) {
+        if (signbit_fast(xf)) return signbit_fast(yf) ? static_cast<float>(-kPi) : static_cast<float>(kPi);
+        return yf;   // preserves +-0.0f
+    }
+    if (xf == 0.0f) return signbit_fast(yf) ? static_cast<float>(-kPi2) : static_cast<float>(kPi2);
+    const double ay = std::fabs(static_cast<double>(yf));
+    const double ax = std::fabs(static_cast<double>(xf));
+    double a = ay <= ax ? fast_atan_unit(ay / ax) : (kPi2 - fast_atan_unit(ax / ay));
+    if (xf < 0.0f) a = kPi - a;
+    return static_cast<float>(yf < 0.0f ? -a : a);
+}
+
+inline float fast_acosf_core(float xf) noexcept {
+    if (xf == 1.0f) return 0.0f;
+    if (xf == -1.0f) return 3.14159265358979323846f;
+    if (xf == 0.0f) return 1.57079632679489661923f;
+    const double x = static_cast<double>(xf);
+    if (x > 0.0) {
+        const double z = std::sqrt((1.0 - x) / (1.0 + x));   // in (0, 1)
+        return static_cast<float>(2.0 * fast_atan_unit(z));
+    }
+    const double z = std::sqrt((1.0 + x) / (1.0 - x));       // in (0, 1)
+    return static_cast<float>(3.14159265358979323846 - 2.0 * fast_atan_unit(z));
+}
+
 template <typename R, R (*Fn)(R)>
 FX_GENERATED_ABI bool leaf_trig(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
     if (!safe_normal_or_zero(x)) return false;
-    const R r = Fn(x);
+    R r;
+    if constexpr (sizeof(R) == 4) {
+        if constexpr (Fn == static_cast<float (*)(float)>(&std::sin)) {
+            float c{};
+            if (!fast_sincosf_core(x, r, c)) return false;
+        } else if constexpr (Fn == static_cast<float (*)(float)>(&std::cos)) {
+            float s{};
+            if (!fast_sincosf_core(x, s, r)) return false;
+        } else if constexpr (Fn == static_cast<float (*)(float)>(&std::atan)) {
+            r = fast_atanf_core(x);
+        } else {
+            r = Fn(x);
+        }
+    } else {
+        r = Fn(x);
+    }
     if (!safe_normal_or_zero(r)) return false;
     fp_ret(ctx, r);
     return true;
@@ -1714,8 +1851,13 @@ FX_GENERATED_ABI bool leaf_sincos_stret(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
     if (!safe_normal_or_zero(x)) return false;
-    const R s = std::sin(x);
-    const R c = std::cos(x);
+    R s, c;
+    if constexpr (sizeof(R) == 4) {
+        if (!fast_sincosf_core(x, s, c)) return false;
+    } else {
+        s = std::sin(x);
+        c = std::cos(x);
+    }
     if (!safe_normal_or_zero(s) || !is_finite_fast(c)) return false;
     fp_ret(ctx, s, 0);
     fp_ret(ctx, c, 1);
@@ -1736,7 +1878,8 @@ FX_GENERATED_ABI bool leaf_acos(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0);
     if (!(x >= R{-1} && x <= R{1})) return false;
-    fp_ret(ctx, std::acos(x));
+    if constexpr (sizeof(R) == 4) fp_ret(ctx, fast_acosf_core(x));
+    else fp_ret(ctx, std::acos(x));
     return true;
 }
 
@@ -1792,7 +1935,10 @@ FX_GENERATED_ABI bool leaf_atan2(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R y = fp_arg<R>(ctx, 0), x = fp_arg<R>(ctx, 1);
     if (!is_finite_fast(y) || !is_finite_fast(x)) return false;
-    const R r = std::atan2(y, x);
+    const R r = [&]() -> R {
+        if constexpr (sizeof(R) == 4) return fast_atan2f_core(y, x);
+        else return std::atan2(y, x);
+    }();
     if ((r == R{0} && y != R{0}) || !safe_normal_or_zero(r)) return false;
     fp_ret(ctx, r);
     return true;
@@ -1803,7 +1949,7 @@ FX_GENERATED_ABI bool leaf_pow(fx::GuestContext& ctx) {
     if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
     const R x = fp_arg<R>(ctx, 0), y = fp_arg<R>(ctx, 1);
     if (!is_finite_fast(x) || !is_finite_fast(y)) return false;
-    if (x == R{0} && !std::signbit(x) && y > R{0}) {
+    if (x == R{0} && !signbit_fast(x) && y > R{0}) {
         fp_ret(ctx, R{0});
         return true;
     }

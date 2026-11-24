@@ -51,6 +51,13 @@ extern void* malloc_zone_malloc(struct zone*, size_t);
 extern void malloc_zone_free(struct zone*, void*);
 extern int pthread_create(unsigned long*, const void*, void* (*)(void*), void*);
 extern int pthread_join(unsigned long, void**);
+extern float sinf(float);
+extern float cosf(float);
+extern float atanf(float);
+extern float atan2f(float, float);
+extern float acosf(float);
+struct fx_float2 { float sinval; float cosval; };
+extern struct fx_float2 __sincosf_stret(float);
 
 /* Called through volatile pointers: the compiler neither inlines nor folds them. */
 static void* (*volatile p_memcpy)(void*, const void*, size_t) = memcpy;
@@ -386,6 +393,96 @@ static int threads(void) {
     return ok;
 }
 
+/* ---- 11: single-precision trig/inverse-trig math leaves ---- */
+static float (*volatile p_sinf)(float) = sinf;
+static float (*volatile p_cosf)(float) = cosf;
+static float (*volatile p_atanf)(float) = atanf;
+static float (*volatile p_atan2f)(float, float) = atan2f;
+static float (*volatile p_acosf)(float) = acosf;
+static struct fx_float2 (*volatile p_sincosf)(float) = __sincosf_stret;
+
+static unsigned fbits(float x) {
+    union { float f; unsigned u; } v;
+    v.f = x;
+    return v.u;
+}
+static float ffrom(unsigned u) {
+    union { float f; unsigned u; } v;
+    v.u = u;
+    return v.f;
+}
+static int close_f(float a, float b, float tol) {
+    const float d = a - b;
+    return d >= -tol && d <= tol;
+}
+
+static int math_leaves(void) {
+    const float pi = 3.14159265358979323846f;
+    const float pi2 = 1.57079632679489661923f;
+    const float nz = ffrom(0x80000000u);
+    const float pz = 0.0f;
+    const float inf = ffrom(0x7f800000u);
+    const float nanv = ffrom(0x7fc00000u);
+
+    /* Repeat so both first-call SVC and subsequent native leaf entries run. */
+    for (int rep = 0; rep < 3; ++rep) {
+        /* Signed zero & boundary exactness */
+        if (fbits(p_sinf(pz)) != 0x00000000u || fbits(p_sinf(nz)) != 0x80000000u) return 0;
+        if (p_cosf(pz) != 1.0f || p_cosf(nz) != 1.0f) return 0;
+        {
+            const struct fx_float2 z0 = p_sincosf(pz), z1 = p_sincosf(nz);
+            if (fbits(z0.sinval) != 0x00000000u || z0.cosval != 1.0f) return 0;
+            if (fbits(z1.sinval) != 0x80000000u || z1.cosval != 1.0f) return 0;
+        }
+        if (fbits(p_atanf(pz)) != 0x00000000u || fbits(p_atanf(nz)) != 0x80000000u) return 0;
+        if (fbits(p_atan2f(pz, pz)) != 0x00000000u || fbits(p_atan2f(nz, pz)) != 0x80000000u) return 0;
+        if (!close_f(p_atan2f(pz, nz), pi, 1e-6f) || !close_f(p_atan2f(nz, nz), -pi, 1e-6f)) return 0;
+        if (!close_f(p_atan2f(1.0f, pz), pi2, 1e-6f) || !close_f(p_atan2f(-1.0f, nz), -pi2, 1e-6f)) return 0;
+        if (fbits(p_acosf(1.0f)) != 0x00000000u) return 0;
+        if (!close_f(p_acosf(-1.0f), pi, 1e-6f)) return 0;
+        if (!close_f(p_acosf(pz), pi2, 1e-6f) || !close_f(p_acosf(nz), pi2, 1e-6f)) return 0;
+
+        /* Fallback cases: huge angles (> 1e6), NaN, Inf, out-of-domain acos, atan2 underflow */
+        {
+            const float big = 1.0e7f;
+            const struct fx_float2 sb = p_sincosf(big);
+            if (!close_f(sb.sinval, p_sinf(big), 1e-6f) || !close_f(sb.cosval, p_cosf(big), 1e-6f)) return 0;
+            if (!close_f(sb.sinval * sb.sinval + sb.cosval * sb.cosval, 1.0f, 1e-5f)) return 0;
+        }
+        if (p_sinf(nanv) == p_sinf(nanv) || p_cosf(inf) == p_cosf(inf)) return 0;
+        if (p_acosf(1.5f) == p_acosf(1.5f) || p_acosf(-1.5f) == p_acosf(-1.5f)) return 0;
+        if (p_atan2f(1.0e-30f, 1.0e30f) != 0.0f) return 0;
+
+        /* Dense sweep checking sin/cos/sincos/atan/atan2/acos identities across all quadrants */
+        for (int i = -400; i <= 400; ++i) {
+            const float a = (float)i * 0.0078125f;   /* [-3.125, +3.125], inside (-pi, pi) */
+            const struct fx_float2 sc = p_sincosf(a);
+            const float s = p_sinf(a), c = p_cosf(a);
+            if (fbits(sc.sinval) != fbits(s) || fbits(sc.cosval) != fbits(c)) return 0;
+            if (!close_f(s * s + c * c, 1.0f, 1e-6f)) return 0;
+            if (!close_f(p_atan2f(s, c), a, 1e-6f)) return 0;
+            if (a >= 0.0f && !close_f(p_acosf(c), a, 2e-6f)) return 0;
+            if (c > 0.1f || c < -0.1f) {
+                const float t = s / c;
+                const float at = p_atanf(t);
+                /* tan(at) == s/c -> sin(at)*c - cos(at)*s == 0 */
+                const struct fx_float2 sat = p_sincosf(at);
+                if (!close_f(sat.sinval * c - sat.cosval * s, 0.0f, 2e-6f)) return 0;
+            }
+        }
+        /* Large-angle reduction sweep (|x| up to 5e5, multiple quadrants) */
+        for (int k = 1; k <= 100; ++k) {
+            const float x = (float)k * 4999.123f;
+            const struct fx_float2 sc = p_sincosf(x);
+            const struct fx_float2 sc_neg = p_sincosf(-x);
+            if (!close_f(sc.sinval * sc.sinval + sc.cosval * sc.cosval, 1.0f, 1e-6f)) return 0;
+            if (!close_f(sc.sinval + sc_neg.sinval, 0.0f, 1e-6f)) return 0;
+            if (!close_f(sc.cosval - sc_neg.cosval, 0.0f, 1e-6f)) return 0;
+        }
+    }
+    return 1;
+}
+
 int main(void) {
     if (!copies()) { puts("fx leaf calls: case 1 (copies) failed"); return 1; }
     if (!fills()) { puts("fx leaf calls: case 2 (fills) failed"); return 2; }
@@ -397,6 +494,7 @@ int main(void) {
     if (!allocations()) { puts("fx leaf calls: case 8 (allocator calls) failed"); return 8; }
     if (!guest_default()) { puts("fx leaf calls: case 9 (a guest default zone) failed"); return 9; }
     if (!threads()) { puts("fx leaf calls: case 10 (allocator threads) failed"); return 10; }
+    if (!math_leaves()) { puts("fx leaf calls: case 11 (math leaves) failed"); return 11; }
     puts("fx leaf calls: ok");
     return 0;
 }
