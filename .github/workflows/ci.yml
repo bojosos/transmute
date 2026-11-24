@@ -129,7 +129,7 @@ jobs:
             libturbojpeg0-dev libpng-dev libtiff-dev libgif-dev \
             libcurl4-openssl-dev libssl-dev libpulse-dev libasound2-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libvulkan-dev mesa-vulkan-drivers xvfb fonts-dejavu-core fonts-liberation
+            libvulkan-dev mesa-vulkan-drivers xvfb fonts-dejavu-core fonts-liberation fonts-wqy-zenhei
 
       - name: Restore the compiler cache
         uses: actions/cache@v4
