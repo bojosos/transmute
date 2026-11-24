@@ -545,6 +545,18 @@ static int math_leaves(void) {
             if (p_fmaxf(fsnan, 1.0f) != 1.0f || (read_fpsr() & 1UL) == 0) return 0;
             clear_fpsr();
             if (p_fmin(1.0, dsnan) != 1.0 || (read_fpsr() & 1UL) == 0) return 0;
+
+            /* Tiny normal (FLT_MIN = 0x1p-126): cosf/acosf/atanf/atan2f must NOT raise spurious FE_UNDERFLOW (FPSR.UFC = bit 3). */
+            const float flt_min = ffrom(0x00800000u);
+            clear_fpsr();
+            rf = p_cosf(flt_min);
+            if (rf != 1.0f || (read_fpsr() & 0x08UL) != 0) return 0;
+            clear_fpsr();
+            rf = p_acosf(flt_min);
+            if (!close_f(rf, pi2, 1e-6f) || (read_fpsr() & 0x08UL) != 0) return 0;
+            clear_fpsr();
+            rf = p_atan2f(1.0f, flt_min);
+            if (!close_f(rf, pi2, 1e-6f) || (read_fpsr() & 0x08UL) != 0) return 0;
         }
 
         /* Dense sweep checking sin/cos/sincos/atan/atan2/acos identities across all quadrants */

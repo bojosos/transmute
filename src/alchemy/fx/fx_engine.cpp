@@ -1725,8 +1725,11 @@ struct SincosfResult {
 };
 
 ALCHEMY_FORCEINLINE SincosfResult fast_sincosf_core(float xf) noexcept {
-    if (xf == 0.0f) return {xf, 1.0f, true};   // preserve -0.0f
-    if ((std::bit_cast<std::uint32_t>(xf) & 0x7fffffffu) > 0x49742400u) return {0.0f, 0.0f, false};   // |xf| > 1e6
+    const std::uint32_t abits = std::bit_cast<std::uint32_t>(xf) & 0x7fffffffu;
+    if (abits == 0u) return {xf, 1.0f, true};   // preserve -0.0f
+    // Decline |xf| < 2^-27 (so Estrin r^8 never underflows double and raises
+    // spurious FE_UNDERFLOW on tiny normals like 0x1p-126) or |xf| > 1e6.
+    if (abits - 0x32000000u > 0x49742400u - 0x32000000u) return {0.0f, 0.0f, false};
     const double x = static_cast<double>(xf);
     // 3-part Cody-Waite split of pi/2: top two parts have 20 trailing zero
     // mantissa bits so kd * kPi2_1 and kd * kPi2_2 are exact for all |k| < 2^20.
@@ -1829,22 +1832,32 @@ ALCHEMY_FORCEINLINE double fast_atan_unit(double z) noexcept {
     return off + t + (t * u) * poly;
 }
 
-ALCHEMY_FORCEINLINE float fast_atanf_core(float xf) noexcept {
-    if (xf == 0.0f) return xf;
+ALCHEMY_FORCEINLINE bool fast_atanf_core(float xf, float& out) noexcept {
+    const std::uint32_t abits = std::bit_cast<std::uint32_t>(xf) & 0x7fffffffu;
+    if (abits == 0u) {
+        out = xf;
+        return true;
+    }
+    // Keep |xf| in [2^-27, 2^27] so Estrin u^4 never underflows double.
+    if (abits - 0x32000000u > 0x4d000000u - 0x32000000u) return false;
     const double ax = std::fabs(static_cast<double>(xf));
     constexpr double kPi2 = 1.57079632679489661923;
     const double a = ax <= 1.0 ? fast_atan_unit(ax) : (kPi2 - fast_atan_unit(1.0 / ax));
-    return static_cast<float>(signbit_fast(xf) ? -a : a);
+    out = static_cast<float>(signbit_fast(xf) ? -a : a);
+    return true;
 }
 
-ALCHEMY_FORCEINLINE float fast_atan2f_core(float yf, float xf) noexcept {
+ALCHEMY_FORCEINLINE bool fast_atan2f_core(float yf, float xf, float& out) noexcept {
     constexpr double kPi = 3.14159265358979323846;
     constexpr double kPi2 = 1.57079632679489661923;
     if (yf == 0.0f) {
-        if (signbit_fast(xf)) return signbit_fast(yf) ? static_cast<float>(-kPi) : static_cast<float>(kPi);
-        return yf;   // preserves +-0.0f
+        out = signbit_fast(xf) ? (signbit_fast(yf) ? static_cast<float>(-kPi) : static_cast<float>(kPi)) : yf;
+        return true;
     }
-    if (xf == 0.0f) return signbit_fast(yf) ? static_cast<float>(-kPi2) : static_cast<float>(kPi2);
+    if (xf == 0.0f) {
+        out = signbit_fast(yf) ? static_cast<float>(-kPi2) : static_cast<float>(kPi2);
+        return true;
+    }
 #if defined(_M_X64) || defined(__x86_64__)
     const __m128d vsign = _mm_set_sd(-0.0);
     const __m128d vy = _mm_set_sd(static_cast<double>(yf));
@@ -1852,19 +1865,24 @@ ALCHEMY_FORCEINLINE float fast_atan2f_core(float yf, float xf) noexcept {
     const __m128d vay = _mm_andnot_pd(vsign, vy);
     const __m128d vax = _mm_andnot_pd(vsign, vx);
     const __m128d vswap = _mm_cmpgt_sd(vay, vax);
-    const __m128d vz = _mm_div_sd(_mm_min_sd(vay, vax), _mm_max_sd(vay, vax));
-    const __m128d va0 = _mm_set_sd(fast_atan_unit(_mm_cvtsd_f64(vz)));
+    const double z = _mm_cvtsd_f64(_mm_div_sd(_mm_min_sd(vay, vax), _mm_max_sd(vay, vax)));
+    if (z < 0x1p-30) return false;   // avoid Estrin u^4 double underflow on extreme ratios
+    const __m128d va0 = _mm_set_sd(fast_atan_unit(z));
     const __m128d va1 = _mm_or_pd(_mm_and_pd(vswap, _mm_sub_sd(_mm_set_sd(kPi2), va0)), _mm_andnot_pd(vswap, va0));
     const __m128d vxneg = _mm_cmplt_sd(vx, _mm_setzero_pd());
     const __m128d va2 = _mm_or_pd(_mm_and_pd(vxneg, _mm_sub_sd(_mm_set_sd(kPi), va1)), _mm_andnot_pd(vxneg, va1));
     const __m128d vres = _mm_xor_pd(va2, _mm_and_pd(vy, vsign));
-    return static_cast<float>(_mm_cvtsd_f64(vres));
+    out = static_cast<float>(_mm_cvtsd_f64(vres));
+    return true;
 #else
     const double ay = std::fabs(static_cast<double>(yf));
     const double ax = std::fabs(static_cast<double>(xf));
-    double a = ay <= ax ? fast_atan_unit(ay / ax) : (kPi2 - fast_atan_unit(ax / ay));
+    const double z = ay <= ax ? (ay / ax) : (ax / ay);
+    if (z < 0x1p-30) return false;
+    double a = ay <= ax ? fast_atan_unit(z) : (kPi2 - fast_atan_unit(z));
     if (xf < 0.0f) a = kPi - a;
-    return static_cast<float>(yf < 0.0f ? -a : a);
+    out = static_cast<float>(yf < 0.0f ? -a : a);
+    return true;
 #endif
 }
 
@@ -1969,7 +1987,7 @@ FX_GENERATED_ABI bool leaf_trig(fx::GuestContext& ctx) {
             if (!sc.ok) return false;
             r = sc.c;
         } else if constexpr (Fn == static_cast<float (*)(float)>(&std::atan)) {
-            r = fast_atanf_core(x);
+            if (!fast_atanf_core(x, r)) return false;
         } else {
             r = Fn(x);
         }
@@ -2008,8 +2026,13 @@ FX_GENERATED_ABI bool leaf_asin(fx::GuestContext& ctx) {
     const R x = fp_arg<R>(ctx, 0);
     if (!safe_normal_or_zero(x)) return false;
     if (!(x >= R{-1} && x <= R{1})) return false;
-    if constexpr (sizeof(R) == 4) fp_ret(ctx, fast_asinf_core(x));
-    else fp_ret(ctx, std::asin(x));
+    if constexpr (sizeof(R) == 4) {
+        const std::uint32_t abits = std::bit_cast<std::uint32_t>(x) & 0x7fffffffu;
+        if (abits != 0u && abits < 0x32000000u) return false;   // avoid Estrin w^8 double underflow
+        fp_ret(ctx, fast_asinf_core(x));
+    } else {
+        fp_ret(ctx, std::asin(x));
+    }
     return true;
 }
 
@@ -2019,8 +2042,13 @@ FX_GENERATED_ABI bool leaf_acos(fx::GuestContext& ctx) {
     const R x = fp_arg<R>(ctx, 0);
     if (!is_finite_fast(x)) return false;
     if (!(x >= R{-1} && x <= R{1})) return false;
-    if constexpr (sizeof(R) == 4) fp_ret(ctx, fast_acosf_core(x));
-    else fp_ret(ctx, std::acos(x));
+    if constexpr (sizeof(R) == 4) {
+        const std::uint32_t abits = std::bit_cast<std::uint32_t>(x) & 0x7fffffffu;
+        if (abits != 0u && abits < 0x32000000u) return false;   // avoid Estrin w^8 double underflow
+        fp_ret(ctx, fast_acosf_core(x));
+    } else {
+        fp_ret(ctx, std::acos(x));
+    }
     return true;
 }
 
@@ -2081,8 +2109,11 @@ FX_GENERATED_ABI bool leaf_atan2(fx::GuestContext& ctx) {
     const R y = fp_arg<R>(ctx, 0), x = fp_arg<R>(ctx, 1);
     if (!is_finite_fast(y) || !is_finite_fast(x)) return false;
     R r;
-    if constexpr (sizeof(R) == 4) r = fast_atan2f_core(y, x);
-    else r = std::atan2(y, x);
+    if constexpr (sizeof(R) == 4) {
+        if (!fast_atan2f_core(y, x, r)) return false;
+    } else {
+        r = std::atan2(y, x);
+    }
     if (!safe_normal_or_zero(r) || (r == R{0} && y != R{0})) return false;
     fp_ret(ctx, r);
     return true;
