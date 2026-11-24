@@ -398,6 +398,11 @@ bool emit_fhm(FpEmit& e, const Inst& in);         // FMLAL/FMLSL(2)
 // Consecutive independent 128-bit by-element FMUL/FMLA/FMLS pair sharing (es, rm, index):
 // broadcasts rm[index] once and emits both operations.
 bool emit_elem_pair(FpEmit& e, const Inst& in0, const Inst& in1);
+// Pairwise FP sum reduction: FADDP Vd.4S, Vn.4S, Vn.4S + FADDP Sd2, Vd.2S
+// (when Sd2 == Vd or Vd is dead after the pair) without 3-uop vhaddps.
+bool emit_faddp_reduce(FpEmit& e, const Inst& in0, const Inst& in1);
+// Tier-2 derived broadcast facts for 128-bit FP by-element ops (FMUL/FMULX/FMLA/FMLS).
+const FamilyFacts* fp_family_facts();
 // Consecutive 128-bit FMAX/FMIN/FMAXNM/FMINNM chain (AVX, cold deferral, dead host flags):
 // checks NaN once across all unique initial inputs before writing any destination, then runs
 // the numeric fast paths sequentially (cold stub runs exact FPProcessNaNs on intact inputs).

@@ -2834,3 +2834,146 @@ FX_TEST(neon_wave_q1_embree_minmax_chain_and_sz_dead) {
         FX_CHECK(runner.run(bvh8, ctx, "wave q1 embree bvh8 13-op chain " + std::to_string(k)));
     }
 }
+
+// Wave R:
+// 1. FP by-element vec_derived hoisting (both loop-invariant and same-depth >=3 uses):
+//    FMUL/FMLA/FMLS .4S/.2D by element share precomputed vspill broadcast slots.
+// 2. FADDP Vd.4S, Vn.4S, Vn.4S + FADDP Sd2, Vd.2S fusion (bit-exact & FPSR-exact,
+//    zero spurious overflow from unused lanes).
+// 3. DUP Vd.4S/.2D, Vn.S/D[i] + FSQRT Vd2.4S/.2D, Vd.4S/.2D -> scalar sqrt + broadcast.
+FX_TEST(neon_wave_r_fp_derived_faddp_and_dup_fsqrt) {
+    ensure_registered();
+    coretest::DiffRunner runner;
+    runner.check_relocatable = false;
+    runner.machine.options.optimize = 1;
+
+    // Helper encodings.
+    auto faddp4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x6e20d400u | (rm << 16) | (rn << 5) | rd;   // faddp Vd.4S, Vn.4S, Vm.4S
+    };
+    auto faddp2s = [](unsigned rd, unsigned rn) {
+        return 0x7e30d800u | (rn << 5) | rd;                // faddp Sd, Vn.2S
+    };
+    auto dup4s = [](unsigned rd, unsigned rn, unsigned idx) {
+        return 0x4e000400u | (((idx << 3) | 4u) << 16) | (rn << 5) | rd;
+    };
+    auto dup2d = [](unsigned rd, unsigned rn, unsigned idx) {
+        return 0x4e000400u | (((idx << 4) | 8u) << 16) | (rn << 5) | rd;
+    };
+    auto fsqrt4s = [](unsigned rd, unsigned rn) { return 0x6ea1f800u | (rn << 5) | rd; };
+    auto fsqrt2d = [](unsigned rd, unsigned rn) { return 0x6ee1f800u | (rn << 5) | rd; };
+    auto fmul4s_e = [](unsigned rd, unsigned rn, unsigned rm, unsigned idx) {
+        const unsigned h = (idx >> 1) & 1u, l = idx & 1u;
+        return 0x4f809000u | (l << 21) | (rm << 16) | (h << 11) | (rn << 5) | rd;
+    };
+    auto fmls4s_e = [](unsigned rd, unsigned rn, unsigned rm, unsigned idx) {
+        const unsigned h = (idx >> 1) & 1u, l = idx & 1u;
+        return 0x4f805000u | (l << 21) | (rm << 16) | (h << 11) | (rn << 5) | rd;
+    };
+    auto fadd4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4e20d400u | (rm << 16) | (rn << 5) | rd;
+    };
+    auto fabs4s = [](unsigned rd, unsigned rn) { return 0x4ea0f800u | (rn << 5) | rd; };
+    auto fabs2d = [](unsigned rd, unsigned rn) { return 0x4ee0f800u | (rn << 5) | rd; };
+
+    // Program 1: Embree-style same-depth 4x reuse of v11[0..2] + Cycles-style
+    // FADDP.4S + FADDP.2S + DUP + FSQRT (both S and D, lane 0 and non-zero lanes).
+    // FABS before DUP+FSQRT guarantees non-negative inputs (except explicit -0.0f)
+    // so bit-exact oracle comparison validates exact lane values and FPSR without
+    // x64-vs-A64 QNaN sign-bit differences on sqrt(negative).
+    const std::vector<std::uint32_t> prog = {
+        fadd4s(11, 11, 12),          // single reaching def of v11 at depth 0
+        // 4 uses each of v11[2], v11[1], v11[0] -> same-depth >=3 derived hoist!
+        fmul4s_e(1, 0, 11, 2),
+        fmls4s_e(1, 2, 11, 1),
+        fmls4s_e(1, 3, 11, 0),
+        fmul4s_e(4, 0, 11, 2),
+        fmls4s_e(4, 2, 11, 1),
+        fmls4s_e(4, 3, 11, 0),
+        fmul4s_e(5, 0, 11, 2),
+        fmls4s_e(5, 2, 11, 1),
+        fmls4s_e(5, 3, 11, 0),
+        fmul4s_e(6, 0, 11, 2),
+        fmls4s_e(6, 2, 11, 1),
+        fmls4s_e(6, 3, 11, 0),
+        // FADDP.4S + FADDP.2S + FABS + DUP.4S[0] + FSQRT.4S (in-place)
+        faddp4s(7, 1, 1),
+        faddp2s(7, 7),
+        fabs4s(7, 7),
+        dup4s(7, 7, 0),
+        fsqrt4s(7, 7),
+        // Non-zero lane DUP + FSQRT (.4S lane 2 and .2D lane 1)
+        fabs4s(4, 4),
+        dup4s(8, 4, 2),
+        fsqrt4s(8, 8),
+        fabs2d(5, 5),
+        dup2d(9, 5, 1),
+        fsqrt2d(9, 9),
+        // Explicit -0.0f in lane 0 of v10 -> DUP + FSQRT must preserve -0.0f in all lanes
+        dup4s(10, 10, 0),
+        fsqrt4s(10, 10),
+    };
+    const auto pack4 = [](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return std::pair<std::uint64_t, std::uint64_t>{
+            static_cast<std::uint64_t>(a) | (static_cast<std::uint64_t>(b) << 32),
+            static_cast<std::uint64_t>(c) | (static_cast<std::uint64_t>(d) << 32),
+        };
+    };
+    static constexpr std::uint32_t kEdge[] = {
+        0x3f800000u, 0x40000000u, 0xbf800000u, 0x00000000u,
+        0x80000000u, 0x7e800000u, 0xfe800000u, 0x7fc01234u,
+    };
+    for (unsigned k = 0; k < 16; ++k) {
+        auto ctx = runner.context(98500 + k);
+        // Put -0.0f in v10 lane 0 and non-zero/NaN in upper lanes to verify scalar vsqrtss ignores them.
+        const auto m0 = pack4(0x80000000u, 0xbf800000u, 0x7f800001u, 0x00000001u);
+        ctx.v[10][0] = m0.first; ctx.v[10][1] = m0.second;
+        if (k < 8) {
+            // Includes large +/-1e38f pairs to verify FADDP.4S+FADDP.2S raises no
+            // spurious overflow FPSR from lane1+lane1!
+            const auto p0 = pack4(kEdge[k], kEdge[(k + 5) & 7], kEdge[(k + 6) & 7], kEdge[(k + 1) & 7]);
+            ctx.v[0][0] = p0.first;  ctx.v[0][1] = p0.second;
+            ctx.v[11][0] = pack4(0x3f000000u, 0xbf000000u, 0x3e800000u, 0x3f800000u).first;
+            ctx.v[11][1] = pack4(0x3f000000u, 0xbf000000u, 0x3e800000u, 0x3f800000u).second;
+            ctx.v[12][0] = 0; ctx.v[12][1] = 0;
+        }
+        FX_CHECK(runner.run(prog, ctx, "wave r fp_derived+faddp+dup_fsqrt " + std::to_string(k)));
+    }
+    // Program 2: negative / NaN / sNaN inputs to DUP + FSQRT produce bit-identical
+    // vector lanes and FPSR with fusion (optimize=1) vs unfused (optimize=0).
+    const std::vector<std::uint32_t> prog_neg = {
+        dup4s(1, 0, 2),
+        fsqrt4s(1, 1),
+        dup2d(2, 3, 1),
+        fsqrt2d(2, 2),
+        0xd4200000u,   // BRK #0
+    };
+    const auto begin = reinterpret_cast<std::uint64_t>(prog_neg.data());
+    const auto end = begin + prog_neg.size() * 4;
+    const auto stop = begin + (prog_neg.size() - 1) * 4;
+    BufferCode neg_code(begin, end);
+    const auto run_opt = [&](std::int8_t opt, GuestContext ctx) {
+        runner.machine.reset();
+        runner.machine.options.optimize = opt;
+        ctx.pc = begin;
+        const auto res = runner.machine.run(ctx, neg_code, stop);
+        FX_CHECK(res.ok);
+        return ctx;
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = runner.context(98600 + k);
+        const auto p = pack4(kEdge[k], kEdge[(k + 2) & 7], kEdge[(k + 4) & 7], 0x7f800001u);
+        ctx.v[0][0] = p.first; ctx.v[0][1] = p.second;
+        ctx.v[3][0] = 0xfff0000000000000ULL;
+        ctx.v[3][1] = (k & 1) ? 0xbff0000000000000ULL : 0x7ff0000000000001ULL;
+        const auto c0 = run_opt(0, ctx);
+        const auto c1 = run_opt(1, ctx);
+        FX_CHECK_EQ(c1.v[1][0], c0.v[1][0]);
+        FX_CHECK_EQ(c1.v[1][1], c0.v[1][1]);
+        FX_CHECK_EQ(c1.v[2][0], c0.v[2][0]);
+        FX_CHECK_EQ(c1.v[2][1], c0.v[2][1]);
+        FX_CHECK_EQ(c1.fpsr, c0.fpsr);
+    }
+    runner.machine.reset();
+    runner.machine.options.optimize = -1;
+}

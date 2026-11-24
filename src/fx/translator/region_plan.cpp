@@ -1959,7 +1959,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             }
         };
         // classes 0..4: lw[level]; class 5: conditional exit (kPinScale);
-        // class 6: fast-path level-0 exit (2*kPinScale); class 7: off-fast-path level-0 exit (1)
+        // class 6: fast-path level-0 exit (2*kPinScale); class 7: off-fast-path or loop-region level-0 exit (1)
         BitCounter exits[8], vexits[8];
         // Loop weights (scaled by kPinScale = 4): 1 + 8 * level; tier 2: 8^level.
         static constexpr std::int32_t kLinear[5] = {4, 36, 68, 100, 132}, kExp[5] = {4, 32, 256, 2048, 16384};
@@ -1992,14 +1992,14 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             const auto& pi = plan.insts[i];
             const auto clamped = std::min(level, 4);
             const bool on_fast = fast_path_boost && level == 0 && fast_path[static_cast<std::size_t>(i)] != 0;
-            const bool off_fast = fast_path_boost && level == 0 && !on_fast;
+            const bool off_fast = (fast_path_boost && level == 0 && !on_fast) || (has_loops && level == 0);
             const auto w = on_fast ? (lw[0] * 2) : off_fast ? 1 : lw[clamped];
             const bool cold_cont =
                 level == 0 && pi.entry && pi.entry_slot > 0 && i > 0 &&
                 (plan.insts[static_cast<std::size_t>(i - 1)].flow == Flow::interpret ||
                  is_cold_deopt_call(i - 1));
             if (pi.entry && !cold_cont)
-                entry_sum += pi.entry_slot == 0 ? (on_fast ? -lw[0] * 2 : -kPinScale) : -w;   // the region start runs once per entry
+                entry_sum += pi.entry_slot == 0 ? (on_fast ? -lw[0] * 2 : (has_loops ? -1 : -kPinScale)) : -w;   // the region start runs once per entry
             const auto dirty_out = pi.dirty_in | pi.writes;
             const auto vdirty_out = pi.vdirty_in | pi.vwrites;
             int exit_class = -1;   // exits[] index

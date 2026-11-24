@@ -1,6 +1,7 @@
 // fp family: arithmetic, min/max, compares, pairwise, reductions, fused
 // multiply-add, unary operations, selects and moves (owner: fp).
 #include "fx/translator/emit_fp_internal.hpp"
+#include "fx/common/cpu_features.hpp"
 
 #include <algorithm>
 #include <array>
@@ -70,10 +71,17 @@ Xmm element(FpEmit& e, Shape s, unsigned rm, int index) {
 }
 
 Opnd element_op(FpEmit& e, Shape s, unsigned rm, int index) {
+    // Tier 2: precomputed broadcast of a loop-invariant or 3+-use element
+    // (fp_family_facts / EmitContext::vec_derived): direct memory operand in
+    // FMUL/FMLA/FMLS with zero Port-5 shuffles and zero scratch XMM pressure.
+    Mem slot;
+    if (e.avx() && !s.scalar && s.q && (s.es == 32 || s.es == 64) && fp_on(fp_no_slot)) {
+        const unsigned dkind = (s.es == 32 ? 24u : 28u) + static_cast<unsigned>(index);
+        if (e.ctx.vec_derived(rm, dkind, slot)) return Opnd::at(slot);
+    }
     // An element other than a scalar's lane 0 comes straight from a current
     // context slot (one load: movss/movsd/vbroadcastss/movddup) even when a
     // clean copy is in a register (one shuffle saved; EmitContext::vec_slot).
-    Mem slot;
     const bool from_slot = e.avx() && fp_on(fp_no_slot) && (!s.scalar || index > 0) && e.ctx.vec_slot(rm, slot);
     const Opnd m = from_slot ? Opnd::at(slot) : e.src(rm);
     if (!m.is_mem) {
@@ -1754,6 +1762,71 @@ bool emit_arith(FpEmit& e, const Inst& in) {
 
 bool emit_fused_h(FpEmit& e, const Inst& in);
 
+// Pairwise FP sum reduction:
+//   FADDP Vd.4S, Vn.4S, Vn.4S
+//   FADDP Sd2, Vd.2S
+// when Sd2 == Vd or Vd is dead after the pair. Splits Vn into even/odd lane
+// pairs [n0,n2,n0,n2] and [n1,n3,n1,n3] via 1-cycle vpermilps so vaddps
+// performs the exact same (n0+n1) and (n2+n3) additions with identical IEEE
+// rounding and zero spurious MXCSR exceptions, avoiding slow 3-uop vhaddps.
+bool emit_faddp_reduce(FpEmit& e, const Inst& in0, const Inst& in1) {
+    if (!e.avx() || fp_tiny_before_on()) return false;
+    if (in1.k != K::faddp || !in1.sh.scalar || in1.sh.es != 32 || in1.rn != in0.rd) return false;
+    if (in1.rd != in0.rd && !e.ctx.vec_dead_after(2, in0.rd)) return false;
+    const Xmm n = e.vec(in0.rn);
+    const Xmm ev = e.tmp(), od = e.tmp();
+    const Xmm d = e.dest(in1.rd);
+    e.as.vex_rr(vop::vpermilps, false, x64::id(ev), 0, x64::id(n));
+    e.as.db(0x88);   // [n0, n2, n0, n2]
+    e.as.vex_rr(vop::vpermilps, false, x64::id(od), 0, x64::id(n));
+    e.as.db(0xdd);   // [n1, n3, n1, n3]
+    e.op(op::addps, ev, ev, od);             // [n0+n1, n2+n3, n0+n1, n2+n3]
+    e.op_i(op::insertps, od, ev, ev, 0x4e);  // [n2+n3, 0, 0, 0]
+    e.op(op::addss, d, od, ev);              // [(n2+n3)+(n0+n1), 0, 0, 0]
+    return true;
+}
+
+namespace {
+
+unsigned fp_fact_want(std::span<const std::uint32_t> words, FamilyFactWant* out) {
+    if (words.empty() || !fp_on(fp_no_slot)) return 0;
+    Inst in;
+    if (!decode(words[0], in) || in.index < 0 || in.sh.scalar || !in.sh.q) return 0;
+    if (in.sh.es != 32 && in.sh.es != 64) return 0;
+    if (in.k != K::fmul && in.k != K::fmulx && in.k != K::fmla && in.k != K::fmls) return 0;
+    const unsigned kind = (in.sh.es == 32 ? 24u : 28u) + static_cast<unsigned>(in.index);
+    out[0] = {FamilyFactWant::K::derived, in.rm, {kind, 0}};
+    return 1;
+}
+
+void fp_fact_derive(EmitContext& ctx, Xmm src, unsigned kind, const Mem& out) {
+    FpEmit e(ctx);
+    const Xmm t = e.tmp();
+    if (kind >= 24 && kind <= 27) {
+        const auto imm = static_cast<std::uint8_t>((kind - 24) * 0x55);
+        if (e.avx()) {
+            e.as.vex_rr(vop::vpermilps, false, x64::id(t), 0, x64::id(src));
+            e.as.db(imm);
+        } else {
+            e.un_i(op::pshufd, t, src, imm);
+        }
+    } else if (kind == 28) {
+        e.un(op::movddup, t, src);
+    } else if (kind == 29) {
+        e.un_i(op::pshufd, t, src, 0xee);
+    } else {
+        return;
+    }
+    e.as.movups(out, t);
+}
+
+} // namespace
+
+const FamilyFacts* fp_family_facts() {
+    static const FamilyFacts facts{&fp_fact_want, nullptr, nullptr, &fp_fact_derive};
+    return &facts;
+}
+
 bool emit_elem_pair(FpEmit& e, const Inst& in0, const Inst& in1) {
     if (!e.avx() || fp_tiny_before_on()) return false;
     const auto ok_kind = [&](K k) { return k == K::fmul || ((k == K::fmla || k == K::fmls) && e.feat.fma); };
@@ -1763,6 +1836,11 @@ bool emit_elem_pair(FpEmit& e, const Inst& in0, const Inst& in1) {
     if (in1.sh.scalar || !in1.sh.q || in1.sh.es != s.es || in1.rm != in0.rm || in1.index != in0.index) return false;
     // Require no RAW, WAR, or WAW hazards between in0 and in1 (self-update rd == rn is allowed).
     if (in0.rd == in0.rm || in1.rd == in0.rm || in0.rd == in1.rd || in0.rd == in1.rn || in1.rd == in0.rn) return false;
+    // If Tier 2 precomputed the broadcast element, let each op take the direct
+    // memory operand (2 instructions, 0 shuffles, 0 temp XMMs vs 3 instructions).
+    if (Mem dummy{}; fp_on(fp_no_slot) &&
+        e.ctx.vec_derived(in0.rm, (s.es == 32 ? 24u : 28u) + static_cast<unsigned>(in0.index), dummy))
+        return false;
     const Opnd b = element_op(e, s, in0.rm, in0.index);
     const bool dbl = s.dbl();
     const auto emit_one = [&](const Inst& in) {
@@ -1831,8 +1909,9 @@ bool emit_fused(FpEmit& e, const Inst& in) {
             e.fma(kind, FmaForm::f231, dbl, s.scalar, d, f1, f2);
             zero = zero || s.scalar;
         } else if (d == f1) {   // d aliases a factor (aliasing contexts)
-            // f2 in memory is a guest register (element temps are registers).
-            e.fma(kind, FmaForm::f213, dbl, s.scalar, d, f2.is_mem ? e.vec(static_cast<unsigned>(f2g)) : f2.reg, acc);
+            // f2 in memory is either a guest register or a derived broadcast slot (f2g < 0).
+            const Xmm f2r = f2.is_mem ? (f2g >= 0 ? e.vec(static_cast<unsigned>(f2g)) : load_opnd(e, f2, s)) : f2.reg;
+            e.fma(kind, FmaForm::f213, dbl, s.scalar, d, f2r, acc);
             zero = zero || (s.scalar && f1g >= 0 && e.zero_above(static_cast<unsigned>(f1g), w));
         } else if (!f2.is_mem && d == f2.reg) {
             e.fma(kind, FmaForm::f213, dbl, s.scalar, d, f1, acc);

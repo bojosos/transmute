@@ -400,6 +400,8 @@ unsigned element_derived_kind(std::uint32_t w);
 unsigned widen_derived_kind(std::uint32_t w, unsigned which);
 // SMULL|SMLAL + SMLAL by element (16-bit) into one accumulator: 2, else 0.
 unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words);
+// DUP Vd.4S/.2D, Vn.S/D[i] + FSQRT Vd2.4S/.2D, Vd.4S/.2D -> scalar sqrt + broadcast: 2, else 0.
+unsigned emit_dup_fsqrt(EmitContext& ctx, std::span<const std::uint32_t> words);
 
 // ---- shared building blocks (emit_neon_arith.cpp) ----
 enum class Narrow { truncate, sat_signed, sat_unsigned, sat_signed_to_unsigned };

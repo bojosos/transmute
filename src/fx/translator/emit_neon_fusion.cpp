@@ -575,6 +575,60 @@ unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words) 
     return 2;
 }
 
+// Broadcast-then-sqrt fusion (Cycles normalize/length):
+//   DUP   Vd.4S, Vn.S[i]   (or .2D, Vn.D[i])
+//   FSQRT Vd2.4S, Vd.4S    (or .2D)
+// when Vd2 == Vd or Vd is dead after the pair. Because every lane holds the
+// exact same element, scalar vsqrtss/vsqrtsd followed by vpbroadcastd/vmovddup
+// is bit-exact and FPSR-exact (identical exceptions) and 2x higher throughput
+// than packed vsqrtps/vsqrtpd on E-cores.
+unsigned emit_dup_fsqrt(EmitContext& ctx, std::span<const std::uint32_t> words) {
+    if (words.size() < 2) return 0;
+    const auto w0 = words[0], w1 = words[1];
+    // DUP Vd.4S/.2D, Vn.S/D[i]: 0x4e000400 (Q=1, op=0, imm4=0)
+    if ((w0 & 0xffe0fc00u) != 0x4e000400u) return 0;
+    const unsigned imm5 = (w0 >> 16) & 31u;
+    const bool is_s = (imm5 & 7u) == 4u;
+    const bool is_d = (imm5 & 15u) == 8u;
+    if (!is_s && !is_d) return 0;
+    const unsigned idx = is_s ? (imm5 >> 3) : (imm5 >> 4);
+    const unsigned rd0 = w0 & 31u, rn0 = (w0 >> 5) & 31u;
+    // FSQRT Vd2.4S, Vd.4S (0x6ea1f800) or FSQRT Vd2.2D, Vd.2D (0x6ee1f800)
+    const std::uint32_t want_sqrt = is_s ? 0x6ea1f800u : 0x6ee1f800u;
+    if ((w1 & 0xfffffc00u) != want_sqrt) return 0;
+    const unsigned rd1 = w1 & 31u, rn1 = (w1 >> 5) & 31u;
+    if (rn1 != rd0) return 0;
+    if (rd1 != rd0 && !ctx.vec_dead_after(2, rd0)) return 0;
+
+    V v(ctx);
+    if (!v.avx2) return 0;
+    const Xmm n = ctx.read_vec(rn0);
+    const Xmm t = idx != 0 ? v.temp() : Xmm{};
+    const Xmm d = ctx.write_vec(rd1);
+    auto& a = v.a;
+    if (is_s) {
+        Xmm sreg = n;
+        if (idx != 0) {
+            v.op_imm(op::insertps, t, n, n, static_cast<std::uint8_t>((idx << 6) | 0x0e));
+            sreg = t;
+        }
+        // vsqrtss d, sreg, sreg (VEX.F3.0F 51)
+        a.vex_rr(VexOp{2, 1, 0x51, false}, false, x64::id(d), x64::id(sreg), x64::id(sreg));
+        v.vex2(vop::vpbroadcastd, d, d);
+    } else {
+        Xmm sreg = n;
+        if (idx != 0) {
+            v.psrldq(t, n, 8);
+            sreg = t;
+        }
+        // vsqrtsd d, sreg, sreg (VEX.F2.0F 51)
+        a.vex_rr(VexOp{3, 1, 0x51, false}, false, x64::id(d), x64::id(sreg), x64::id(sreg));
+        // vmovddup d, d (VEX.F2.0F 12)
+        a.vex_rr(VexOp{3, 1, 0x12, false}, false, x64::id(d), 0, x64::id(d));
+    }
+    return 2;
+}
+
 } // namespace transmute::fx::neon
 
 namespace transmute::fx {

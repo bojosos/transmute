@@ -3860,6 +3860,14 @@ void RegionEmitter::prepare_facts() {
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     bool preds_built = false;
     bool lmasks_built = false;
+    struct SameDepthDerived {
+        std::int32_t use_idx;
+        std::int32_t def_idx;
+        std::uint8_t vec;
+        std::uint8_t kind;
+        const FamilyFacts* facts;
+    };
+    std::vector<SameDepthDerived> same_depth;
     for (std::int32_t i = 0; i < n; ++i) {
         const auto& pi = plan_.insts[static_cast<std::size_t>(i)];
         if (!(pi.try_family || pi.family >= 0) || pi.flow != Flow::normal) continue;
@@ -3927,13 +3935,23 @@ void RegionEmitter::prepare_facts() {
                                  flaggable && !all_match ? " flag" : "");
                 FactUse use{i, w.vec, 0, 0, w.value};
                 if (w.k == FamilyFactWant::K::derived) {
-                    // Tier 2: computed after every reaching definition, all of
-                    // them in less deeply nested loops than the use.
+                    // Tier 2: computed after every reaching definition when all
+                    // defs are in less deeply nested loops than the use, or
+                    // (same-depth multi-use) when a single reaching def feeds
+                    // >= 3 uses of the same (vec, kind) (e.g. Embree ray.dir
+                    // broadcast 4x per triangle loop iteration).
                     bool ok = known;
                     for (unsigned d = 0; ok && d < n_defs; ++d)
                         ok = plan_.insts[static_cast<std::size_t>(defs[d])].flow == Flow::normal &&
                              s_.depth[static_cast<std::size_t>(defs[d])] < s_.depth[static_cast<std::size_t>(i)];
-                    if (!ok) continue;
+                    if (!ok) {
+                        if (known && n_defs == 1 && plan_.insts[static_cast<std::size_t>(defs[0])].flow == Flow::normal &&
+                            s_.depth[static_cast<std::size_t>(defs[0])] == s_.depth[static_cast<std::size_t>(i)]) {
+                            same_depth.push_back(
+                                {i, defs[0], w.vec, static_cast<std::uint8_t>(w.value.lo), wanting[f]});
+                        }
+                        continue;
+                    }
                     std::size_t slot = 0;
                     while (slot < s_.derived.size() && !(s_.derived[slot].vec == w.vec && s_.derived[slot].kind == w.value.lo))
                         ++slot;
@@ -3979,6 +3997,27 @@ void RegionEmitter::prepare_facts() {
                 s_.fact_uses.push_back(use);
             }
         }
+    }
+    // Promote same-depth derived requests where one reaching definition feeds
+    // >= 3 uses of the exact same (vec, kind): 1 shuffle+store replaces 3+
+    // per-use shuffles and frees a scratch XMM on every consumer.
+    for (std::size_t a = 0; a < same_depth.size(); ++a) {
+        const auto& sd = same_depth[a];
+        unsigned cnt = 0;
+        for (const auto& other : same_depth)
+            if (other.def_idx == sd.def_idx && other.vec == sd.vec && other.kind == sd.kind) ++cnt;
+        if (cnt < 3) continue;
+        std::size_t slot = 0;
+        while (slot < s_.derived.size() && !(s_.derived[slot].vec == sd.vec && s_.derived[slot].kind == sd.kind))
+            ++slot;
+        if (slot == s_.derived.size()) {
+            if (slot >= kMaxDerived) continue;
+            s_.derived.push_back({sd.vec, sd.kind, false});
+        }
+        bool have = false;
+        for (const auto& c : s_.fact_checks) have |= c.kind == 3 && c.def == sd.def_idx && c.flag == slot;
+        if (!have) s_.fact_checks.push_back({sd.def_idx, static_cast<std::uint16_t>(slot), 3, false, sd.facts});
+        s_.fact_uses.push_back({sd.use_idx, sd.vec, 3, static_cast<std::uint16_t>(slot), {sd.kind, 0}});
     }
     // Only definitions that reach a use write its flag: whenever a use runs,
     // the last write of its register was one of its own definitions, and that

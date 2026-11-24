@@ -1215,6 +1215,14 @@ unsigned fp_emit(EmitContext& ctx, std::span<const std::uint32_t> words) {
             return 2;
         }
     }
+    if (words.size() >= 2 && in.k == fpx::K::faddp && !in.sh.scalar && in.sh.q && in.sh.es == 32 && in.rn == in.rm) {
+        fpx::Inst in1;
+        if (fpx::decode(words[1], in1) && fpx::supported(in1, e.feat) && fpx::emit_faddp_reduce(e, in, in1)) {
+            neon::flush_instruction_constants(as);
+            ctx.note_vec_zero_above(in1.rd, 32);
+            return 2;
+        }
+    }
     if (words.size() >= 2 && !in.sh.scalar && in.sh.q &&
         (in.k == fpx::K::fmax || in.k == fpx::K::fmin || in.k == fpx::K::fmaxnm || in.k == fpx::K::fminnm)) {
         if (const unsigned consumed = fpx::emit_minmax_chain(e, words); consumed != 0) {
@@ -1291,10 +1299,10 @@ const FamilyEmitter& fp_family() {
         if (b & fpx::fp_tiny_before) n += "+tinybefore";
         // The core keeps V zero-above facts across labels (Plan::vzero_join; its
         // knob novzjoin is in the layout bits): cached fp code must follow it.
-        n += "+vzj";
+        n += "+vzj+fpdrv";
         return n;
     }();
-    static const FamilyEmitter family{name.c_str(), &fp_emit, &fp_describe};
+    static const FamilyEmitter family{name.c_str(), &fp_emit, &fp_describe, nullptr, fpx::fp_family_facts()};
     return family;
 }
 
