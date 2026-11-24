@@ -243,7 +243,9 @@ void Device::initialize(const DeviceOptions& options) {
     if (options.presentation && has_instance_extension(VK_KHR_SURFACE_EXTENSION_NAME)) want_device(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     const bool barycentric = want_device(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     const bool list_restart = want_device(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     const bool local_read = want_device(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+#endif
     const bool divisor = want_device(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) ||
                          want_device(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     // [[stencil]] fragment outputs (SPV_EXT_shader_stencil_export).
@@ -258,7 +260,9 @@ void Device::initialize(const DeviceOptions& options) {
     // ---- features --------------------------------------------------------------
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT supported_restart{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR supported_local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+#endif
     VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR supported_divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features supported13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features supported12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -270,7 +274,9 @@ void Device::initialize(const DeviceOptions& options) {
     void** tail = &supported13.pNext;
     if (barycentric) { *tail = &supported_bary; tail = &supported_bary.pNext; }
     if (list_restart) { *tail = &supported_restart; tail = &supported_restart.pNext; }
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     if (local_read) { *tail = &supported_local_read; tail = &supported_local_read.pNext; }
+#endif
     if (divisor) { *tail = &supported_divisor; tail = &supported_divisor.pNext; }
     vk.vkGetPhysicalDeviceFeatures2(physical, &supported);
 
@@ -291,7 +297,9 @@ void Device::initialize(const DeviceOptions& options) {
     VkPhysicalDeviceVulkan13Features enabled13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR enabled_bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT enabled_restart{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR enabled_local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+#endif
     VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR enabled_divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
 #define ALCHEMY_ENABLE(target, source, field) target.field = source.field;
     // Core 1.0: everything Metal's feature set maps to (no geometry shaders,
@@ -351,11 +359,13 @@ void Device::initialize(const DeviceOptions& options) {
         enabled_restart.primitiveTopologyListRestart = supported_restart.primitiveTopologyListRestart;
         *tail = &enabled_restart; tail = &enabled_restart.pNext;
     }
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     if (local_read && supported_local_read.dynamicRenderingLocalRead) {
         enabled_local_read.dynamicRenderingLocalRead = VK_TRUE;
         *tail = &enabled_local_read; tail = &enabled_local_read.pNext;
         dynamic_rendering_local_read = true;
     }
+#endif
     if (divisor && supported_divisor.vertexAttributeInstanceRateDivisor) {
         enabled_divisor.vertexAttributeInstanceRateDivisor = VK_TRUE;
         *tail = &enabled_divisor; tail = &enabled_divisor.pNext;

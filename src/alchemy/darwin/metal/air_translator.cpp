@@ -141,7 +141,9 @@ TranslatorDevice::TranslatorDevice(Device& device) {
     auto v13 = device.features13;
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT restart{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+#endif
     VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
     enabled.pNext = &v11;
     v11.pNext = &v12;
@@ -156,10 +158,12 @@ TranslatorDevice::TranslatorDevice(Device& device) {
         restart.primitiveTopologyListRestart = device.primitive_topology_list_restart;
         *tail = &restart; tail = &restart.pNext;
     }
+#ifdef VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
     if (device.dynamic_rendering_local_read) {
         local_read.dynamicRenderingLocalRead = VK_TRUE;
         *tail = &local_read; tail = &local_read.pNext;
     }
+#endif
     if (device.vertex_attribute_divisor) {
         divisor.vertexAttributeInstanceRateDivisor = VK_TRUE;
         *tail = &divisor; tail = &divisor.pNext;

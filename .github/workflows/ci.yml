@@ -99,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        host: [linux, null]
+        host: [linux, 'null']
     env:
       ALCHEMY_GUI_CLOAK: "1"
       ALCHEMY_GUI_NO_ACTIVATE: "1"

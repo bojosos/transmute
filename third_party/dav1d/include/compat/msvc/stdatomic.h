@@ -32,7 +32,13 @@
 #pragma warning(push)
 #pragma warning(disable:4067)    /* newline for __has_include_next */
 
-#if defined(__clang__) && __has_include_next(<stdatomic.h>)
+#if defined(__clang__)
+#  if __has_include_next(<stdatomic.h>)
+#    define DAV1D_HAVE_CLANG_STDATOMIC_H 1
+#  endif
+#endif
+
+#if defined(DAV1D_HAVE_CLANG_STDATOMIC_H)
    /* use the clang stdatomic.h with clang-cl*/
 #  include_next <stdatomic.h>
 #else /* ! stdatomic.h */
