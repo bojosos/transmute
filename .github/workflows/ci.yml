@@ -166,9 +166,10 @@ jobs:
         run: python3 scripts/ci/linux_ctest.py test build scripts/ci/linux_tests.txt
 
       # alchemy_gui_host's window server, screens, cursors and input queries need an X server.
+      # -noreset prevents Xvfb from resetting when short-lived AnyConnection queries (monitors -> idle_ms) drop clients to 0.
       - name: Test alchemy_gui_host (linux, Xvfb)
         if: matrix.host == 'linux'
-        run: xvfb-run -a -s "-screen 0 1280x800x24" ctest --test-dir build -R '^alchemy_gui_host$' --output-on-failure --timeout 600
+        run: xvfb-run -a -s "-screen 0 1280x800x24 -noreset" ctest --test-dir build -R '^alchemy_gui_host$' --output-on-failure --timeout 600
 
       - name: Compiler cache statistics
         if: always()
