@@ -369,14 +369,60 @@ inline std::uint64_t add(std::uint64_t address, std::uint64_t size) {
     return address + size;
 }
 
+// ALCHEMY_TRACE_EFAULT=1: every EFAULT a libSystem call returns is reported on stderr with the call, its first
+// six arguments and the guest buffer validate() refused, its region queried then and again at the report (an
+// accessible region at the report means the first query saw a transient state). For intermittent "Bad address"
+// reports; off by default.
+struct EfaultNote {
+    bool set{};
+    std::uint64_t address{}, size{};
+    bool write{};
+    std::optional<transmute::GuestMemory::RegionInfo> region;
+};
+inline thread_local EfaultNote efault_note;
+inline bool trace_efault() {
+    static const bool on = [] { const auto value = host::process::environment("ALCHEMY_TRACE_EFAULT"); return value && value->starts_with("1"); }();
+    return on;
+}
+inline std::string efault_region_text(const std::optional<transmute::GuestMemory::RegionInfo>& region) {
+    if (!region) return "no region";
+    char text[128];
+    std::snprintf(text, sizeof(text), "region 0x%llx+0x%llx %c%c%c%s", static_cast<unsigned long long>(region->base),
+                  static_cast<unsigned long long>(region->size), region->readable ? 'r' : '-', region->writable ? 'w' : '-',
+                  region->executable ? 'x' : '-', region->mapped ? "" : " (not mapped)");
+    return text;
+}
+inline void report_efault(std::string_view call, const std::array<std::uint64_t, 6>& x, const transmute::GuestMemory& memory) {
+    char arguments[160];
+    std::snprintf(arguments, sizeof(arguments), "0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx",
+                  static_cast<unsigned long long>(x[0]), static_cast<unsigned long long>(x[1]),
+                  static_cast<unsigned long long>(x[2]), static_cast<unsigned long long>(x[3]),
+                  static_cast<unsigned long long>(x[4]), static_cast<unsigned long long>(x[5]));
+    std::string line = "[alchemy efault] " + std::string(call) + "(" + arguments + ")";
+    if (efault_note.set) {
+        char buffer[96];
+        std::snprintf(buffer, sizeof(buffer), ": %s buffer 0x%llx+0x%llx refused, ", efault_note.write ? "output" : "input",
+                      static_cast<unsigned long long>(efault_note.address), static_cast<unsigned long long>(efault_note.size));
+        std::optional<transmute::GuestMemory::RegionInfo> now;
+        try { now = memory.query_region(efault_note.address); } catch (...) {}
+        line += buffer + efault_region_text(efault_note.region) + "; now " + efault_region_text(now);
+    } else {
+        line += ": not from a buffer check";
+    }
+    efault_note = {};
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 inline void validate(const transmute::GuestMemory& memory, std::uint64_t address,
               std::uint64_t size, bool write) {
     if (size > UINT64_MAX - address) throw ServiceError{efault};
     while (size) {
         const auto region = memory.query_region(address);
         if (!region || (write ? !region->writable : !region->readable) ||
-            address < region->base || address - region->base >= region->size)
+            address < region->base || address - region->base >= region->size) {
+            if (trace_efault()) efault_note = {true, address, size, write, region};
             throw ServiceError{efault};
+        }
         const auto count = std::min(size, region->size - (address - region->base));
         address += count;
         size -= count;
@@ -1537,10 +1583,20 @@ public:
     // two-register function and takes a nonzero x1 for a known macOS 13.3-26.0 kernel bug (crbug.com/400642488),
     // failing the write with ERR_NETWORK_CHANGED. Operations that return a pair use install_raw instead.
     void install(std::string name, Operation operation, std::uint64_t failure = UINT64_MAX) {
+        auto call = trace_efault() ? name : std::string{};
         static_cast<void>(context.install_function(std::move(name),
-            [this, operation = std::move(operation), failure](auto& state, auto& memory) {
+            [this, operation = std::move(operation), failure, call = std::move(call)](auto& state, auto& memory) {
+                std::array<std::uint64_t, 6> arguments{};
+                if (!call.empty()) {
+                    efault_note.set = false;
+                    for (std::size_t index = 0; index < arguments.size(); ++index) arguments[index] = state.x[index];
+                }
                 try { state.x[0] = operation(state, memory); }
-                catch (const ServiceError& error) { context.set_errno(error.value); state.x[0] = failure; }
+                catch (const ServiceError& error) {
+                    if (error.value == efault && !call.empty()) report_efault(call, arguments, memory);
+                    context.set_errno(error.value);
+                    state.x[0] = failure;
+                }
                 catch (const std::bad_alloc&) { context.set_errno(enomem); state.x[0] = failure; }
                 state.x[1] = 0;
             }));

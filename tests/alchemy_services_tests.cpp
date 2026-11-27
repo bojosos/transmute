@@ -779,6 +779,9 @@ void freed_large_blocks() {
     // The release is on record, for fx's fault message (released_ranges.hpp).
     const auto released = alchemy::released_ranges::find(block + 1000);
     require(released && released->first.address == block && released->first.size >= 300 * 1024, "the released mapping is on record");
+    // Unmapped buffer validation fails with EFAULT (also exercises ALCHEMY_TRACE_EFAULT when enabled).
+    require(f.call("_write", {1, 0x1000, 16}) == UINT64_MAX && f.engine.read32(f.call("___error", {})) == 14,
+            "write with unmapped buffer returns EFAULT");
 }
 
 int main(int argc, char** argv) {
