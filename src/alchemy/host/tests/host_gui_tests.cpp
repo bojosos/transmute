@@ -579,7 +579,9 @@ void real_backend() {
     require(host::ui::show_alert({}).error() == host::Error::invalid_argument, "an alert without buttons is refused");
     require(host::ui::disable_windows({}, 0).empty(), "no windows, none disabled");
     host::ui::enable_windows({});
-    require(static_cast<bool>(host::ui::screen_reader()) && static_cast<bool>(host::ui::desktop_picture()), "shell settings answer");
+    require(static_cast<bool>(host::ui::screen_reader()) && static_cast<bool>(host::ui::dark_appearance()) &&
+                static_cast<bool>(host::ui::desktop_picture()),
+            "shell settings answer");
     require(static_cast<bool>(host::ui::reveal_files({})), "revealing nothing opens nothing");
     // Vulkan: the loader is the system's (or there is none).
     {

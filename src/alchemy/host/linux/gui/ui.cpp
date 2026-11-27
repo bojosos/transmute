@@ -5,12 +5,18 @@
 //
 // - Idle time is the X ScreenSaver extension's; the keyboard kind follows
 //   the XKB layout (_XKB_RULES_NAMES): jp is JIS, us ANSI, others ISO.
-// - Appearance and accessibility come from GTK's settings (GTK_THEME, then
-//   $XDG_CONFIG_HOME/gtk-3.0/settings.ini); without them the answers are
-//   the defaults (light, animations on, no high contrast). A running screen
-//   reader is not detected (no AT-SPI client): false.
-// - Opening and revealing hand the target to xdg-open (the desktop's file
-//   manager shows the folder; it cannot select the file).
+// - Appearance and accessibility come from the desktop's GSettings where its
+//   schemas are installed (GIO loaded at run time): org.gnome.desktop.interface
+//   color-scheme, gtk-theme and enable-animations; org.gnome.desktop.a11y
+//   interface high-contrast and applications screen-reader-enabled. GTK_THEME
+//   overrides the theme; without GSettings, GTK 3's settings.ini answers;
+//   without either, the defaults (light, animations on, no high contrast, no
+//   screen reader).
+// - The desktop picture is org.gnome.desktop.background's picture-uri (or
+//   picture-uri-dark in dark appearance) when it names a file.
+// - Revealing asks the desktop's file manager to show and select the items
+//   (org.freedesktop.FileManager1.ShowItems on the session bus); without
+//   one, xdg-open opens their folders. Opening hands the target to xdg-open.
 // - Spelling is Hunspell's (libhunspell-1.7.so.0, loaded at run time), with
 //   the dictionaries in /usr/share/hunspell (apt install hunspell-en-us ...).
 //   Without the library there are no languages.
@@ -37,8 +43,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 extern char** environ;
 
@@ -75,8 +84,86 @@ std::map<std::string, std::string> gtk_settings() {
 
 bool truthy(const std::string& value) { return value == "1" || value == "true" || value == "TRUE"; }
 
+// ---- GIO (GSettings and GDBus), loaded at run time ----
+struct Gio {
+    using Source = void;
+    using Schema = void;
+    using Object = void;
+    using Variant = void;
+    struct Error { std::uint32_t domain; int code; char* message; };
+    Source* (*schema_source_default)() = nullptr;
+    Schema* (*schema_lookup)(Source*, const char*, int) = nullptr;
+    int (*schema_has_key)(Schema*, const char*) = nullptr;
+    void (*schema_unref)(Schema*) = nullptr;
+    Object* (*settings_new)(const char*) = nullptr;
+    int (*get_boolean)(Object*, const char*) = nullptr;
+    char* (*get_string)(Object*, const char*) = nullptr;
+    void (*free)(void*) = nullptr;
+    void (*object_unref)(Object*) = nullptr;
+    Object* (*bus_get_sync)(int, void*, Error**) = nullptr;
+    Variant* (*call_sync)(Object*, const char*, const char*, const char*, const char*, Variant*, const void*, int, int, void*, Error**) = nullptr;
+    Variant* (*variant_new)(const char*, ...) = nullptr;
+    void (*variant_unref)(Variant*) = nullptr;
+    void (*error_free)(Error*) = nullptr;
+    char* (*filename_to_uri)(const char*, const char*, Error**) = nullptr;
+    char* (*filename_from_uri)(const char*, char**, Error**) = nullptr;
+};
+
+const Gio* gio() {
+    static const Gio* const api = []() -> const Gio* {
+        void* library = dlopen("libgio-2.0.so.0", RTLD_NOW | RTLD_LOCAL);
+        if (!library) return nullptr;
+        auto* loaded = new Gio;
+        const auto bind = [&](auto& slot, const char* name) { slot = reinterpret_cast<std::remove_reference_t<decltype(slot)>>(dlsym(library, name)); return slot != nullptr; };
+        if (!bind(loaded->schema_source_default, "g_settings_schema_source_get_default") || !bind(loaded->schema_lookup, "g_settings_schema_source_lookup") ||
+            !bind(loaded->schema_has_key, "g_settings_schema_has_key") || !bind(loaded->schema_unref, "g_settings_schema_unref") ||
+            !bind(loaded->settings_new, "g_settings_new") || !bind(loaded->get_boolean, "g_settings_get_boolean") ||
+            !bind(loaded->get_string, "g_settings_get_string") || !bind(loaded->free, "g_free") || !bind(loaded->object_unref, "g_object_unref") ||
+            !bind(loaded->bus_get_sync, "g_bus_get_sync") || !bind(loaded->call_sync, "g_dbus_connection_call_sync") ||
+            !bind(loaded->variant_new, "g_variant_new") || !bind(loaded->variant_unref, "g_variant_unref") ||
+            !bind(loaded->error_free, "g_error_free") || !bind(loaded->filename_to_uri, "g_filename_to_uri") ||
+            !bind(loaded->filename_from_uri, "g_filename_from_uri")) {
+            delete loaded;
+            return nullptr;
+        }
+        return loaded;
+    }();
+    return api;
+}
+
+// A GSettings key, when the desktop installs its schema (g_settings_new
+// aborts on an unknown schema or key, so both are looked up first).
+template <class T, class Read>
+std::optional<T> gsetting(const char* schema_id, const char* key, Read read) {
+    const auto* g = gio();
+    if (!g) return std::nullopt;
+    auto* source = g->schema_source_default();
+    auto* schema = source ? g->schema_lookup(source, schema_id, 1) : nullptr;
+    if (!schema) return std::nullopt;
+    const bool has = g->schema_has_key(schema, key) != 0;
+    g->schema_unref(schema);
+    if (!has) return std::nullopt;
+    auto* settings = g->settings_new(schema_id);
+    if (!settings) return std::nullopt;
+    std::optional<T> value = read(*g, settings);
+    g->object_unref(settings);
+    return value;
+}
+std::optional<bool> gsetting_bool(const char* schema_id, const char* key) {
+    return gsetting<bool>(schema_id, key, [key](const Gio& g, void* settings) { return g.get_boolean(settings, key) != 0; });
+}
+std::optional<std::string> gsetting_string(const char* schema_id, const char* key) {
+    return gsetting<std::string>(schema_id, key, [key](const Gio& g, void* settings) {
+        char* text = g.get_string(settings, key);
+        std::string value = text ? text : "";
+        g.free(text);
+        return value;
+    });
+}
+
 std::string theme_name() {
     if (auto theme = environment("GTK_THEME"); !theme.empty()) return theme;
+    if (auto theme = gsetting_string("org.gnome.desktop.interface", "gtk-theme"); theme && !theme->empty()) return *theme;
     const auto settings = gtk_settings();
     const auto it = settings.find("gtk-theme-name");
     return it == settings.end() ? std::string() : it->second;
@@ -269,22 +356,31 @@ Result<KeyboardKind> keyboard_kind() {
 }
 
 Result<bool> reduce_motion() {
+    if (const auto animations = gsetting_bool("org.gnome.desktop.interface", "enable-animations")) return !*animations;
     const auto settings = gtk_settings();
     const auto it = settings.find("gtk-enable-animations");
     return it != settings.end() && !truthy(it->second);
 }
 
 Result<bool> high_contrast() {
+    if (gsetting_bool("org.gnome.desktop.a11y.interface", "high-contrast").value_or(false)) return true;
     const auto theme = theme_name();
     return theme.find("HighContrast") != std::string::npos || theme.find("high-contrast") != std::string::npos;
 }
 
-Result<bool> screen_reader() { return false; }
+Result<bool> screen_reader() {
+    return gsetting_bool("org.gnome.desktop.a11y.applications", "screen-reader-enabled").value_or(false);
+}
 
 Result<bool> dark_appearance() {
     const auto theme = theme_name();
     if (theme.find(":dark") != std::string::npos || theme.find("-dark") != std::string::npos || theme.find("-Dark") != std::string::npos)
         return true;
+    if (environment("GTK_THEME").empty())
+        if (const auto scheme = gsetting_string("org.gnome.desktop.interface", "color-scheme")) {
+            if (*scheme == "prefer-dark") return true;
+            if (*scheme == "prefer-light") return false;
+        }
     const auto settings = gtk_settings();
     const auto it = settings.find("gtk-application-prefer-dark-theme");
     return it != settings.end() && truthy(it->second);
@@ -316,13 +412,54 @@ Status shell_open(std::string_view target, std::string_view verb, std::string_vi
     return launch({"xdg-open", std::string(target)});
 }
 
+namespace {
+// The desktop's file manager shows and selects `paths`
+// (org.freedesktop.FileManager1.ShowItems); false when there is none.
+bool show_items(std::span<const std::string> paths) {
+    const auto* g = gio();
+    if (!g || paths.empty()) return false;
+    Gio::Error* error = nullptr;
+    auto* bus = g->bus_get_sync(2 /* G_BUS_TYPE_SESSION */, nullptr, &error);
+    if (!bus) {
+        if (error) g->error_free(error);
+        return false;
+    }
+    std::vector<char*> uris;
+    for (const auto& path : paths) {
+        std::error_code ec;
+        const auto absolute = std::filesystem::absolute(path, ec);
+        if (ec) continue;
+        if (char* uri = g->filename_to_uri(absolute.string().c_str(), nullptr, nullptr)) uris.push_back(uri);
+    }
+    if (uris.empty()) {
+        g->object_unref(bus);
+        return false;
+    }
+    uris.push_back(nullptr);
+    // (^ass): the URIs and an empty startup id. The call waits up to 2 s for the file manager.
+    auto* reply = g->call_sync(bus, "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1", "ShowItems",
+                               g->variant_new("(^ass)", uris.data(), ""), nullptr, 0, 2000, nullptr, &error);
+    for (auto* uri : uris) g->free(uri);
+    g->object_unref(bus);
+    if (!reply) {
+        if (error) g->error_free(error);
+        return false;
+    }
+    g->variant_unref(reply);
+    return true;
+}
+} // namespace
+
 Status reveal_file(std::string_view path) {
     if (path.empty()) return Error::invalid_argument;
+    const std::string one[] = {std::string(path)};
+    if (show_items(one)) return {};
     const auto folder = std::filesystem::path(std::string(path)).parent_path();
     return launch({"xdg-open", folder.empty() ? std::string(".") : folder.string()});
 }
 
 Status reveal_files(std::span<const std::string> paths) {
+    if (show_items(paths)) return {};
     std::set<std::string> folders;
     for (const auto& path : paths) {
         const auto folder = std::filesystem::path(path).parent_path().string();
@@ -334,8 +471,19 @@ Status reveal_files(std::span<const std::string> paths) {
 
 void add_recent_document(std::string_view) {}
 
-// No desktop picture this backend can read without the desktop's own service.
-Result<std::string> desktop_picture() { return std::string(); }
+// The desktop background's picture file (GSettings), in dark appearance its
+// dark variant where set; "" when there is none or it is not a file.
+Result<std::string> desktop_picture() {
+    const auto* g = gio();
+    std::optional<std::string> uri;
+    if (dark_appearance().value_or(false)) uri = gsetting_string("org.gnome.desktop.background", "picture-uri-dark");
+    if (!uri || uri->empty()) uri = gsetting_string("org.gnome.desktop.background", "picture-uri");
+    if (!g || !uri || uri->empty()) return std::string();
+    char* path = g->filename_from_uri(uri->c_str(), nullptr, nullptr);
+    std::string result = path ? path : "";
+    g->free(path);
+    return result;
+}
 Status set_desktop_picture(std::string_view) { return Error::unsupported; }
 
 // ---- the frame timer: a timerfd ----
