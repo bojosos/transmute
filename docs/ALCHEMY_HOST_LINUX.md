@@ -197,20 +197,37 @@ This page maps each host area to Linux. The Linux backends are in progress.
     real X input through `xdotool`, `gui_window_events` reports clicks,
     double clicks, the wheel, shifted keys, arrows, function keys and
     modifier changes;
-  * QLab gets through `NSApplicationMain` and loads its main nib, then
-    stops at its first system font: CoreText maps Apple's UI fonts to
-    Windows families (Segoe UI, Arial), which need a substitute on Linux.
+  * QLab draws its welcome window (fontconfig stand-ins for the Windows
+    families CoreText names);
+  * Blender headless (`-b`, a Python expression adding a mesh); VS Code as
+    Node (`--version` with `ELECTRON_RUN_AS_NODE=1`);
+  * Mach ports, file ports and IOSurfaces between processes
+    (`alchemy_fx_mach_cross`, the IOSurface cross-process tests).
+* **Descriptors for other processes** (`fd_broker.cpp`). Linux has no
+  DuplicateHandle: a descriptor reaches another process only over a UNIX
+  socket (`SCM_RIGHTS`), with the receiver taking part. Every process of the
+  backend runs a descriptor broker thread on the abstract socket
+  `alchemy-fd-broker.<uid>.<pid>`, which takes a descriptor and answers with
+  its number there. A child started suspended takes them over its spawn gate
+  (a socket pair) and keeps them across `execve`.
+  `process::duplicate_into`, `sections::duplicate_into` and
+  `net::export_socket` go through it. Only the same user's processes are
+  served.
 * **Not done yet:**
   * DWARF CFI for the code arena, so C++ exceptions crossing translated frames
     fail on Linux;
-  * passing descriptors to other processes;
   * case-insensitive lookups under the Alchemy root (WSL's kernel has no ext4
     casefold);
-  * font family substitution for the Windows names CoreText asks for;
-  * the x64 reference JIT and the PE personality (Windows-only by design).
-* **CI.** `.github/workflows/linux.yml` builds both backends in an Ubuntu
-  26.04 container and runs `alchemy_host`, `fx_host_tests`,
-  `alchemy_process`, `alchemy_cli` and `alchemy_gui_host` (on Xvfb).
+  * the x64 reference JIT and the PE personality (Windows-only by design);
+  * Blender's window and VS Code's window: Blender reads a null pointer after
+    creating its window (before its Metal setup); VS Code's main process
+    stops at an unaligned guest allocation inside a guest-space placeholder.
+* **Guest runs on WSL.** WSL sessions inherit WSLg's `DISPLAY=:0` (the
+  desktop): set `DISPLAY` to a private `Xvfb` display or unset it. Don't set
+  `HOME` to a guest path either: the host reads it too.
+* **CI.** `.github/workflows/ci.yml`'s `linux` job builds both backends on
+  `ubuntu-24.04` with Clang 21 and runs the tests in
+  `scripts/ci/linux_tests.txt` (180 tests) and `alchemy_gui_host` on Xvfb.
 
 The macOS layer (`src/alchemy/darwin/`, the loader, the Objective-C
 runtime) talks to the operating system only through the host API in

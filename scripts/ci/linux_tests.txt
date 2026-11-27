@@ -4,7 +4,7 @@
 # (no session bus, no audio server, no display). alchemy_gui_host runs in its
 # own step on Xvfb.
 #
-# Left out, with the reason (counts at 79dd8df0 + the Linux batch, 2026-11-10):
+# Left out, with the reason (counts with Linux descriptor passing):
 # - 53 test targets do not build on Linux: Windows-only test sources (the PE
 #   loader, the Win64 ABI and SEH, the x64 JIT, the Win32 window server's
 #   tables, ...).
@@ -15,9 +15,6 @@
 #   alchemy_gui_text_input, alchemy_gui_metal_triangle(_resize),
 #   alchemy_gui_metal_iosurface_present, alchemy_gui_metalkit_view,
 #   alchemy_gui_quartzcore_backingstore.
-# - 3 pass Mach ports or IOSurfaces between processes, which needs descriptor
-#   passing (SCM_RIGHTS) on Linux, not written yet: alchemy_fx_mach_cross,
-#   alchemy_gui_metal_iosurface_cross, alchemy_gui_quartzcore_iosurface_cross.
 # - 1 registers a Bonjour service (alchemy_gui_bonjour_fixture; it fails on
 #   the Windows runner too).
 # - 20 fail on Linux gaps still open, each a follow-up:
@@ -49,6 +46,7 @@ alchemy_fx_leaf_calls_globals
 alchemy_fx_leaf_calls_handlers
 alchemy_fx_leaf_calls_no_alloc_leaf
 alchemy_fx_leaf_calls_no_probe_leaf
+alchemy_fx_mach_cross
 alchemy_fx_mach_ports
 alchemy_fx_table_shadow
 alchemy_fx_table_shadow_off
@@ -132,6 +130,7 @@ alchemy_gui_media_unit
 alchemy_gui_mediaplayer
 alchemy_gui_metal_compute
 alchemy_gui_metal_iosurface
+alchemy_gui_metal_iosurface_cross
 alchemy_gui_metal_iosurface_staged
 alchemy_gui_metalfx
 alchemy_gui_network_cookies
@@ -162,6 +161,7 @@ alchemy_gui_quartz2d_unit
 alchemy_gui_quartzcore_core_image
 alchemy_gui_quartzcore_graphics
 alchemy_gui_quartzcore_graphics_math
+alchemy_gui_quartzcore_iosurface_cross
 alchemy_gui_quartzcore_layer_kinds
 alchemy_gui_quartzcore_layer_tree
 alchemy_gui_quartzcore_renderer
