@@ -256,7 +256,8 @@ functions. The argument table must be bound with at least
 
 * Key: `compiler_version()` (format number, stdlib fingerprint, clang
   version) + every `CompileOptions` field + source hash and length. Memory
-  map, then `ALCHEMY_MSL_CACHE` (default `%LOCALAPPDATA%/Alchemy/msl`,
+  map, then `ALCHEMY_MSL_CACHE` (default `msl` in the host cache directory:
+  `%LOCALAPPDATA%/Alchemy/msl`, on Linux `$XDG_CACHE_HOME/alchemy/msl`;
   `0`/`off` disables) `results/<hash>.bin` (full key stored inside and
   compared; written to a private file and renamed). Only successful results
   are written to disk.

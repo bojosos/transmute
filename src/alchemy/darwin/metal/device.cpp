@@ -3,6 +3,8 @@
 #include "alchemy/darwin/metal/bindless.hpp"
 #include "alchemy/host/gpu.hpp"
 #include "alchemy/host/process.hpp"
+#include "alchemy/host/system.hpp"
+#include "alchemy/path.hpp"
 
 #include "alchemy/gui/install.hpp"
 #include "alchemy/darwin/metal/formats.hpp"
@@ -428,10 +430,10 @@ void Device::initialize(const DeviceOptions& options) {
     if (options.pipeline_cache) cache_path_ = *options.pipeline_cache;
     else if (const auto configured = environment("ALCHEMY_METAL_PIPELINE_CACHE"); !configured.empty()) {
         if (configured != "0") cache_path_ = configured;
-    } else if (const auto local = environment("LOCALAPPDATA"); !local.empty()) {
+    } else if (const auto cache = host::system::known_directory(host::system::Directory::cache)) {
         std::ostringstream name;
         name << "metal-pipeline-cache-" << std::hex << properties.vendorID << '-' << properties.deviceID << ".bin";
-        cache_path_ = std::filesystem::path(local) / "Alchemy" / name.str();
+        cache_path_ = utf8_path(*cache) / name.str();
     }
     std::vector<char> initial;
     if (!cache_path_.empty()) {

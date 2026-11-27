@@ -1,5 +1,6 @@
 #include "alchemy/gui/install.hpp"
 #include "alchemy/host/process.hpp"
+#include "alchemy/host/system.hpp"
 #include "alchemy/path.hpp"
 #include "alchemy/darwin/metal/bridge.hpp"
 #include "alchemy/macho.hpp"
@@ -20,7 +21,8 @@ std::string environment_value(const char* name) {
     return host::process::environment(name).value_or(std::string());
 }
 // The seed set of this executable: <root>/<LC_UUID>, root ALCHEMY_MSL_SEED
-// or %LOCALAPPDATA%\Alchemy\msl-seed ($XDG_CACHE_HOME or ~/.cache/alchemy/msl-seed off Windows).
+// or the cache directory's msl-seed (%LOCALAPPDATA%\Alchemy\msl-seed; $XDG_CACHE_HOME/alchemy/msl-seed
+// or ~/.cache/alchemy/msl-seed on Linux).
 std::filesystem::path msl_seed_directory(const std::filesystem::path& root, const std::filesystem::path& executable) {
     const auto uuid = macho_uuid(executable);
     return uuid ? root / *uuid : std::filesystem::path{};
@@ -28,14 +30,8 @@ std::filesystem::path msl_seed_directory(const std::filesystem::path& root, cons
 std::filesystem::path msl_seed_root() {
     if (auto value = environment_value("ALCHEMY_MSL_SEED"); !value.empty())
         return value == "0" ? std::filesystem::path{} : utf8_path(value);
-    if (const auto local = environment_value("LOCALAPPDATA"); !local.empty()) return utf8_path(local) / "Alchemy" / "msl-seed";
-#if defined(_WIN32)
-    return {};
-#else
-    if (const auto cache = environment_value("XDG_CACHE_HOME"); !cache.empty()) return utf8_path(cache) / "alchemy" / "msl-seed";
-    const auto home = environment_value("HOME");
-    return home.empty() ? std::filesystem::path{} : utf8_path(home) / ".cache" / "alchemy" / "msl-seed";
-#endif
+    const auto cache = host::system::known_directory(host::system::Directory::cache);
+    return cache ? utf8_path(*cache) / "msl-seed" : std::filesystem::path{};
 }
 } // namespace
 

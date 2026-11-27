@@ -17,6 +17,8 @@
 #include "alchemy/host/files.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/sync.hpp"
+#include "alchemy/host/system.hpp"
+#include "alchemy/path.hpp"
 
 #include <array>
 #include <cstddef>
@@ -302,8 +304,7 @@ const std::filesystem::path& cache_root() {
         auto value = environment("ALCHEMY_MSL_CACHE");
         if (value == "0" || value == "off") return std::filesystem::path{};
         if (!value.empty()) return std::filesystem::path(value);
-        const auto local = environment("LOCALAPPDATA");
-        if (!local.empty()) return std::filesystem::path(local) / "Alchemy" / "msl";
+        if (const auto cache = host::system::known_directory(host::system::Directory::cache)) return utf8_path(*cache) / "msl";
         return std::filesystem::temp_directory_path() / "alchemy-msl";
     }();
     return root;
