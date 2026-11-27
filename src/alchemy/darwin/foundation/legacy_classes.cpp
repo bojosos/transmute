@@ -91,6 +91,8 @@ void Provider::install() {
         store(made, "title", s.x[3]);
         s.x[0] = bridge->autorelease(made);
     }, true);
+    // Undocumented runtime value; value is ours, unverified (Firefox's XUL imports it).
+    string(fill::foundation, "_NSUserNotificationDefaultSoundName", "NSUserNotificationDefaultSoundName");
 }
 
 } // namespace

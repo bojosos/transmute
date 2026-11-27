@@ -608,6 +608,27 @@ void install_foundation_classes(Provider& p, ObjcRuntime& objc, CoreFoundation& 
     raw("_NSStringFromRange", [string_result](CpuState& s, GuestMemory&) {
         string_result(s, "{" + std::to_string(s.x[0]) + ", " + std::to_string(s.x[1]) + "}");
     });
+    // NSRange NSRangeFromString(NSString *): scans two unsigned integers "{loc, len}" (skipping non-digits); {0, 0} on nil/missing.
+    raw("_NSRangeFromString", [&cf](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = 0; s.x[1] = 0; return; }
+        const auto text = cf.utf8(s.x[0]);
+        std::size_t at = 0;
+        const auto scan = [&]() -> std::optional<std::uint64_t> {
+            while (at < text.size() && (text[at] < '0' || text[at] > '9')) ++at;
+            if (at >= text.size()) return std::nullopt;
+            std::uint64_t value = 0;
+            while (at < text.size() && text[at] >= '0' && text[at] <= '9') {
+                const auto digit = static_cast<std::uint64_t>(text[at] - '0');
+                value = value <= (UINT64_MAX - digit) / 10 ? value * 10 + digit : UINT64_MAX;
+                ++at;
+            }
+            return value;
+        };
+        const auto location = scan();
+        const auto length = location ? scan() : std::nullopt;
+        s.x[0] = location && length ? *location : 0;
+        s.x[1] = location && length ? *length : 0;
+    });
     raw("_NSStringFromPoint", [real, number, string_result](CpuState& s, GuestMemory&) {
         string_result(s, "{" + number(real(s, 0)) + ", " + number(real(s, 1)) + "}");
     });

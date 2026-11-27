@@ -377,8 +377,11 @@ void CoreFoundationGaps::install_strings() {
     // No hyphenation dictionaries are available.
     constant(core_foundation, "_CFStringIsHyphenationAvailableForLocale", 0);
     constant(core_foundation, "_CFStringGetHyphenationLocationBeforeIndex", static_cast<Address>(not_found));
-    // NS* names CoreFoundation exports.
+    // NS* names CoreFoundation exports (NSGregorianCalendar is the deprecated synonym for
+    // NSCalendarIdentifierGregorian, exported by both CoreFoundation and Foundation).
     string(core_foundation, "_NSCalendarIdentifierGregorian", "gregorian");
+    string(core_foundation, "_NSGregorianCalendar", "gregorian");
+    string(foundation, "_NSGregorianCalendar", "gregorian");
     string(core_foundation, "_NSSystemTimeZoneDidChangeNotification", "NSSystemTimeZoneDidChangeNotification");
     string(core_foundation, "_kCFTimeZoneSystemTimeZoneDidChangeNotification", "NSSystemTimeZoneDidChangeNotification");
 }

@@ -28,6 +28,7 @@ public:
 
     void install() {
         string(foundation, "_NSArgumentDomain", "NSArgumentDomain");
+        string(foundation, "_NSGlobalDomain", "NSGlobalDomain");
         string(foundation, "_NSProcessInfoThermalStateDidChangeNotification", "NSProcessInfoThermalStateDidChangeNotification");
 
         // OSType NSHFSTypeCodeFromFileType(NSString *): "'abcd'" -> 'abcd', otherwise 0.

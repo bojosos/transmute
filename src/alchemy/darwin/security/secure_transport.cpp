@@ -42,8 +42,10 @@ struct SslState final : ObjectPayload {
     Address scratch{}, length_cell{};         // guest I/O buffers (owned)
     std::string peer_name;
     bool break_on_server_auth{}, break_on_client_auth{};
+    bool verify_cert{true}, allows_any_root{}, allows_expired_certs{}, allows_expired_roots{};
     std::uint32_t client_auth{};              // SSLAuthenticate
     TlsVersion min_version{TlsVersion::tls10}, max_version{TlsVersion::tls13};
+    std::uint8_t enabled_versions{0x0fu};     // bits 0..3: TLS 1.0, 1.1, 1.2, 1.3 (legacy SSLSetProtocolVersionEnabled)
     std::vector<std::string> alpn;
     std::vector<std::uint16_t> enabled_ciphers;   // SSLSetEnabledCiphers; empty: the host's whole list
     std::unique_ptr<TlsSession> session;
@@ -150,12 +152,16 @@ struct Transport {
             const bool break_now = st.server ? st.break_on_client_auth && peer_has_certificate : st.break_on_server_auth;
             if (break_now) {
                 if (!st.auth_reported) { st.auth_reported = true; return ssl_peer_auth_completed; }
-            } else if (!st.server) {
+            } else if (!st.server && st.verify_cert) {
                 TrustRequest request;
                 request.certificates = st.session->peer_certificates();
                 request.policies.push_back({TrustPolicy::Kind::ssl, true, st.peer_name, 0});
                 const auto outcome = evaluate_trust(request);
-                if (!outcome.trusted) {
+                const bool allowed = outcome.trusted ||
+                    (outcome.status == status::certificate_expired && (st.allows_expired_certs || st.allows_expired_roots)) ||
+                    (st.allows_any_root && outcome.status != status::host_name_mismatch &&
+                     outcome.status != status::certificate_expired && outcome.status != status::certificate_not_yet_valid);
+                if (!allowed) {
                     static_cast<void>(st.session->shutdown(write));
                     st.state = SessionState::aborted;
                     switch (outcome.status) {
@@ -238,17 +244,33 @@ void install_secure_transport(Security& sec) {
         static_cast<void>(self->b.objc.send_super(s.x[0], cls, self->b.objc.selector("dealloc")));
     }, false, "v@:");
 
-    b.function(lib, "_SSLContextGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::ssl_context); });
-    // SSLContextRef SSLCreateContext(CFAllocatorRef, SSLProtocolSide, SSLConnectionType)
-    b.function(lib, "_SSLCreateContext", [self](CpuState& s, GuestMemory&) {
-        if (s.x[2] != 0 || s.x[1] > 1) { s.x[0] = 0; return; }   // stream contexts only (no DTLS)
+    const auto make_context = [self](bool server) {
         const auto object = self->b.objc.allocate(self->context_class);
         auto state = std::make_shared<SslState>();
-        state->server = s.x[1] == 0;
+        state->server = server;
         state->scratch = self->b.process.allocate_guest(scratch_size);
         state->length_cell = self->b.process.allocate_guest(8);
         static_cast<void>(self->b.objc.host_state<SslState>(object, [&] { return state; }));
-        s.x[0] = object;
+        return object;
+    };
+    b.function(lib, "_SSLContextGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::ssl_context); });
+    // SSLContextRef SSLCreateContext(CFAllocatorRef, SSLProtocolSide, SSLConnectionType)
+    b.function(lib, "_SSLCreateContext", [make_context](CpuState& s, GuestMemory&) {
+        if (s.x[2] != 0 || s.x[1] > 1) { s.x[0] = 0; return; }   // stream contexts only (no DTLS)
+        s.x[0] = make_context(s.x[1] == 0);
+    });
+    // Legacy lifecycle (deprecated in macOS 10.8; VLC's securetransport plug-in):
+    // OSStatus SSLNewContext(Boolean isServer, SSLContextRef *contextPtr)
+    b.function(lib, "_SSLNewContext", [make_context](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = status_value(status::param); return; }
+        m.write64(s.x[1], make_context((s.x[0] & 0xff) != 0));
+        s.x[0] = 0;
+    });
+    // OSStatus SSLDisposeContext(SSLContextRef context)
+    b.function(lib, "_SSLDisposeContext", [self](CpuState& s, GuestMemory&) {
+        if (!s.x[0] || !self->b.objc.find_host_state<SslState>(s.x[0])) { s.x[0] = status_value(status::param); return; }
+        self->b.release(s.x[0]);
+        s.x[0] = 0;
     });
     const auto with = [self](auto body) {
         return [self, body](CpuState& s, GuestMemory& m) {
@@ -319,6 +341,46 @@ void install_secure_transport(Security& sec) {
         const auto version = version_of(s.x[1], false);
         if (!configurable(st) || version == TlsVersion::unknown) return status::param;
         st.max_version = version;
+        return 0;
+    }));
+    // Legacy verification & protocol toggles (deprecated in macOS 10.8; VLC's securetransport plug-in).
+    b.function(lib, "_SSLSetEnableCertVerify", with([configurable](SslState& st, CpuState& s, GuestMemory&) -> std::int32_t {
+        if (!configurable(st)) return status::param;
+        st.verify_cert = (s.x[1] & 0xff) != 0;
+        return 0;
+    }));
+    b.function(lib, "_SSLSetAllowsAnyRoot", with([configurable](SslState& st, CpuState& s, GuestMemory&) -> std::int32_t {
+        if (!configurable(st)) return status::param;
+        st.allows_any_root = (s.x[1] & 0xff) != 0;
+        return 0;
+    }));
+    b.function(lib, "_SSLSetAllowsExpiredCerts", with([configurable](SslState& st, CpuState& s, GuestMemory&) -> std::int32_t {
+        if (!configurable(st)) return status::param;
+        st.allows_expired_certs = (s.x[1] & 0xff) != 0;
+        return 0;
+    }));
+    b.function(lib, "_SSLSetAllowsExpiredRoots", with([configurable](SslState& st, CpuState& s, GuestMemory&) -> std::int32_t {
+        if (!configurable(st)) return status::param;
+        st.allows_expired_roots = (s.x[1] & 0xff) != 0;
+        return 0;
+    }));
+    b.function(lib, "_SSLSetProtocolVersionEnabled", with([configurable](SslState& st, CpuState& s, GuestMemory&) -> std::int32_t {
+        if (!configurable(st)) return status::param;
+        const bool enable = (s.x[2] & 0xff) != 0;
+        std::uint8_t mask = 0;
+        switch (s.x[1]) {
+        case 2: case 3: return enable ? status::param : 0;   // SSL 2 / SSL 3 are never negotiated
+        case 4: case 5: mask = 1u << 0; break;               // kTLSProtocol1 / kTLSProtocol1Only
+        case 6: mask = 0x0fu; break;                         // kSSLProtocolAll
+        case 7: mask = 1u << 1; break;                       // kTLSProtocol11
+        case 8: mask = 1u << 2; break;                       // kTLSProtocol12
+        case 10: case 999: mask = 1u << 3; break;            // kTLSProtocol13
+        default: return status::param;
+        }
+        if (enable) st.enabled_versions |= mask; else st.enabled_versions &= static_cast<std::uint8_t>(~mask);
+        static constexpr TlsVersion order[] = {TlsVersion::tls10, TlsVersion::tls11, TlsVersion::tls12, TlsVersion::tls13};
+        for (int i = 0; i < 4; ++i) if (st.enabled_versions & (1u << i)) { st.min_version = order[i]; break; }
+        for (int i = 3; i >= 0; --i) if (st.enabled_versions & (1u << i)) { st.max_version = order[i]; break; }
         return 0;
     }));
     b.function(lib, "_SSLGetProtocolVersionMin", with([](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {

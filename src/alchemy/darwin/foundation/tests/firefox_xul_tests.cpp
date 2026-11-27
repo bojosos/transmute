@@ -122,6 +122,8 @@ const Case foundation_firefox_xul_case("foundation_firefox_xul", [](Fixture& f) 
             "no reachable port name server");
     const auto action = f.send(f.cls("NSUserNotificationAction"), "actionWithIdentifier:title:", {f.cf.string("reply"), f.cf.string("Reply")});
     require(f.cf.utf8(f.send(action, "identifier")) == "reply" && f.cf.utf8(f.send(action, "title")) == "Reply", "NSUserNotificationAction");
+    require(f.string_constant(foundation_lib, "_NSUserNotificationDefaultSoundName") == "NSUserNotificationDefaultSoundName",
+            "NSUserNotificationDefaultSoundName");
 
     // Launch Services over FSRefs and MIME types: the same application as the content-type and URL calls
     // (or kLSApplicationNotFoundErr where they find none; other cases may have registered applications).
@@ -153,11 +155,40 @@ const Case foundation_vlc_mpv_case("foundation_vlc_mpv", [](Fixture& f) {
     require(best && f.cf.utf8(best) == "ja", "kana is Japanese");
     require(f.call(cf_lib, "_CFStringTokenizerCopyBestStringLanguage", {f.cf.string("hello"), 0, 5}) == 0, "Latin text alone names no language");
     require(f.string_constant(foundation_lib, "_NSConnectionDidDieNotification") == "NSConnectionDidDieNotification", "NSConnectionDidDieNotification");
-    // SSLCopyPeerCertificates before any handshake: NULL.
+    require(f.string_constant(foundation_lib, "_NSGlobalDomain") == "NSGlobalDomain", "NSGlobalDomain");
+    require(f.string_constant(foundation_lib, "_NSGregorianCalendar") == "gregorian" &&
+                f.string_constant(cf_lib, "_NSGregorianCalendar") == "gregorian",
+            "NSGregorianCalendar");
+    // NSRangeFromString / NSStringFromRange round-trip.
+    const auto formatted = f.call(foundation_lib, "_NSStringFromRange", {12, 34});
+    alchemy::CallRegs range_args{};
+    range_args.x[0] = formatted;
+    const auto parsed = f.regs(foundation_lib, "_NSRangeFromString", range_args);
+    require(parsed.x0 == 12 && parsed.x1 == 34, "NSRangeFromString round-trip");
+    const auto empty_range = f.regs(foundation_lib, "_NSRangeFromString", {});
+    require(empty_range.x0 == 0 && empty_range.x1 == 0, "NSRangeFromString nil");
+    // SSLCopyPeerCertificates before any handshake: NULL, plus legacy SSL context & setters.
     const auto context = f.call(security, "_SSLCreateContext", {0, 1, 0});
     const auto certificates = f.block(8, 0xff);
     require(context && f.status(security, "_SSLCopyPeerCertificates", {context, certificates}) == 0 && f.engine.read64(certificates) == 0,
             "no peer certificates yet");
+    const auto legacy_cell = f.block(8, 0);
+    require(f.status(security, "_SSLNewContext", {0, legacy_cell}) == 0, "SSLNewContext");
+    const auto legacy = f.engine.read64(legacy_cell);
+    require(legacy != 0 &&
+                f.status(security, "_SSLSetEnableCertVerify", {legacy, 0}) == 0 &&
+                f.status(security, "_SSLSetAllowsAnyRoot", {legacy, 1}) == 0 &&
+                f.status(security, "_SSLSetAllowsExpiredCerts", {legacy, 1}) == 0 &&
+                f.status(security, "_SSLSetAllowsExpiredRoots", {legacy, 1}) == 0 &&
+                f.status(security, "_SSLSetProtocolVersionEnabled", {legacy, 3, 0}) == 0 &&
+                f.status(security, "_SSLSetProtocolVersionEnabled", {legacy, 3, 1}) == -50 &&
+                f.status(security, "_SSLSetProtocolVersionEnabled", {legacy, 4, 0}) == 0 &&
+                f.status(security, "_SSLSetProtocolVersionEnabled", {legacy, 7, 0}) == 0,
+            "legacy SSL setters");
+    const auto min_ver = f.block(4, 0);
+    require(f.status(security, "_SSLGetProtocolVersionMin", {legacy, min_ver}) == 0 && f.engine.read32(min_ver) == 8,
+            "disabling TLS 1.0/1.1 raises min to TLS 1.2");
+    require(f.status(security, "_SSLDisposeContext", {legacy}) == 0, "SSLDisposeContext");
     // GSS OID sets.
     const auto minor = f.block(4), set = f.block(8), present = f.block(4);
     const auto oid = f.block(16), elements = f.block(9);
