@@ -404,7 +404,6 @@ public:
         (void)es;
         return false;
     }
-
     // ---- cold out-of-line stubs & host flags liveness (additive) -------------
     // True if host EFLAGS currently hold live guest NZCV that must be
     // preserved (flag-clobbering checks should call clobber_host_flags() or

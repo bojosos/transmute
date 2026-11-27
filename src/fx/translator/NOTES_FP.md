@@ -138,14 +138,21 @@ object so tests link without the core). Tests: `emit_fp_tests*.cpp`.
   differences near min_normal are exact. `fp_zz_tininess_before_rounding_report`
   counts it on boundary operands. `TRANSMUTE_FX_FP=tinybefore` (off by
   default) fixes it for FMUL, FDIV, FNMUL, FMADD/FMSUB/FNMADD/FNMSUB,
-  FMLA/FMLS (vector and by element), FCVT S<-D and FCVTN: the result is
-  compared with +-min_normal (AND, compare, mask move and a not-taken
-  branch, flag-free through JRCXZ), and only on a hit the operation runs
-  again toward zero, which raises UE exactly when A64 raises UFC and no other
-  new flag; MXCSR is rewritten around it with moves and vector ops only (the
-  FPCR/FPSR context words are the scratch). Tests: `fp_tiny_before_rounding_exact_flags`,
-  `fp_tiny_before_rounding_results_bit_exact`. Not covered: FMULX,
-  FRECPS/FRSQRTS, half-precision arithmetic (computed in single and narrowed).
+  FMLA/FMLS (vector and by element), FCVT S<-D and FCVTN. The result is
+  compared with +-min_normal: AND and compare into one vector temp, then
+  PTEST/JCC when the host flags are dead (EmitContext::host_flags_live), else
+  MOVMSKPS and JRCXZ over a near JMP, which leaves them alone; the second
+  source may stay a memory operand. Only on a hit the operation runs again
+  toward zero, which raises UE exactly when A64 raises UFC and no other new
+  flag; MXCSR is rewritten around it with moves and vector ops only (the
+  FPCR/FPSR context words are the scratch). The first version (a GPR guard
+  evicting a cached RCX, three vector temps, sources in registers) cost
+  fxbench fp_scalar and vec_portable about 1.7x. Tests:
+  `fp_tiny_before_rounding_exact_flags`,
+  `fp_tiny_before_rounding_results_bit_exact` and, through the region
+  emitter with live and dead host flags, `fp_region_tiny_before_rounding_flags`.
+  Not covered: FMULX, FRECPS/FRSQRTS, half-precision arithmetic (computed in
+  single and narrowed).
 * FCVTZS/FCVTZU/FCVT[NPMA]*: `roundss/sd` with an explicit mode, then `cvtt*`
   with saturation and NaN -> 0 fixed up behind a branch. FCVTA*/FRINTA use an
   exact trunc / doubled-remainder sequence. FRINTA(+-inf) sets a spurious IOC.

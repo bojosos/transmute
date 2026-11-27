@@ -15,6 +15,7 @@
 #include <xmmintrin.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -3179,4 +3180,87 @@ FX_TEST(fp_region_minmax_qnan_no_spurious_ioc) {
     }
     runner.machine.reset();
     runner.machine.options.optimize = -1;
+}
+
+// TRANSMUTE_FX_FP=tinybefore through the region emitter: FMUL, FDIV, FMLA and
+// FCVT S<-D on operands whose results lie within a few ulps of +-min_normal,
+// once between CMP and B.NE (host flags live: MOVMSKPS/JRCXZ, flags kept) and
+// once with dead flags (PTEST/JCC). FPSR (MRS x28), the result registers and
+// NZCV against the oracle (round to nearest; the other modes are covered by
+// fp_tiny_before_rounding_exact_flags).
+FX_TEST(fp_region_tiny_before_rounding_flags) {
+    ensure_registered();
+    // live: msr fpsr, xzr; cmp x0, x1; fmul s2, s0, s1; fdiv d6, d4, d5; fmla v7.4s, v0.4s, v1.4s;
+    //       fcvt s8, d9; b.ne +2; movz x3, #1; mrs x28, fpsr
+    // dead: the same without cmp / b.ne / movz
+    const std::vector<std::uint32_t> live{0xd51b443fu, 0xeb01001fu, 0x1e210802u, 0x1e651886u, 0x4e21cc07u,
+                                          0x1e624128u, b_cond(kNe, 2), movz_x(3, 1), 0xd53b443cu};
+    const std::vector<std::uint32_t> dead{0xd51b443fu, 0x1e210802u, 0x1e651886u, 0x4e21cc07u, 0x1e624128u,
+                                          0xd53b443cu};
+    fp_set_knobs_for_testing(64);   // fpx::fp_tiny_before
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    coretest::Rng rng(20261110);
+    const auto scaled = [&](int lo, int hi) {
+        const double m = 1.0 + static_cast<double>(rng.next() >> 11) * 0x1p-53;
+        return (rng.next() & 1 ? -1.0 : 1.0) * std::ldexp(m, lo + static_cast<int>(rng.next() % static_cast<unsigned>(hi - lo + 1)));
+    };
+    const auto nudge32 = [&](float x) {
+        for (int k = static_cast<int>(rng.next() % 7) - 3; k != 0; k += k > 0 ? -1 : 1)
+            x = std::nextafterf(x, k > 0 ? HUGE_VALF : -HUGE_VALF);
+        return x;
+    };
+    const auto nudge64 = [&](double x) {
+        for (int k = static_cast<int>(rng.next() % 7) - 3; k != 0; k += k > 0 ? -1 : 1)
+            x = std::nextafter(x, k > 0 ? HUGE_VAL : -HUGE_VAL);
+        return x;
+    };
+    const auto b32 = [](float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return static_cast<std::uint64_t>(u); };
+    const auto b64 = [](double d) { std::uint64_t u; std::memcpy(&u, &d, 8); return u; };
+    unsigned runs = 0, ufc = 0;
+    for (const int optimize : {1, 0}) {
+        runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+        for (unsigned k = 0; k < 96; ++k) {
+            auto ctx = runner.context(91000 + k);
+            ctx.fpcr = 0;
+            ctx.fpsr = 0;
+            ctx.x[0] = k & 1;
+            ctx.x[1] = (k >> 3) & 1;
+            // s0 * s1 and the four lanes of v0 * v1 near single min_normal.
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                const float x = static_cast<float>(scaled(-20, 20));
+                const float y = nudge32(static_cast<float>(0x1p-126 / x));
+                const unsigned shift = (lane & 1) * 32;
+                ctx.v[0][lane / 2] = (ctx.v[0][lane / 2] & ~(0xffffffffull << shift)) | b32(x) << shift;
+                ctx.v[1][lane / 2] = (ctx.v[1][lane / 2] & ~(0xffffffffull << shift)) | b32(rng.next() & 1 ? y : -y) << shift;
+                const float acc = static_cast<float>(std::ldexp(scaled(0, 0), -149 + static_cast<int>(rng.next() % 24)));
+                ctx.v[7][lane / 2] = (ctx.v[7][lane / 2] & ~(0xffffffffull << shift)) | b32(acc) << shift;
+            }
+            // d4 / d5 near double min_normal; d9 near single min_normal.
+            const double y = scaled(-20, 20);
+            ctx.v[5][0] = b64(y);
+            ctx.v[4][0] = b64((rng.next() & 1 ? 1.0 : -1.0) * nudge64(0x1p-1022 * std::fabs(y)));
+            ctx.v[9][0] = b64(0x1p-126 * (1.0 + (static_cast<double>(rng.next() >> 11) * 0x1p-52 - 1.0) * 0x1p-20));
+            for (const auto* w : {&live, &dead}) {
+                runner.report = false;
+                runner.last = {};
+                const bool equal = runner.run(*w, ctx, "");
+                runner.report = true;
+                const bool same = equal && runner.last.ok && std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+                if (!same) {
+                    runner.run(*w, ctx, w == &live ? "tinybefore, flags live" : "tinybefore, flags dead");
+                    FX_CHECK(std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0);
+                    runner.machine.options.optimize = -1;
+                    fp_set_knobs_for_testing(-1);
+                    return;
+                }
+                if (runner.expected.x[28] & 8) ++ufc;
+                ++runs;
+            }
+        }
+    }
+    runner.machine.options.optimize = -1;
+    fp_set_knobs_for_testing(-1);
+    std::printf("    %u runs match the oracle (FPSR, results, NZCV); UFC set in %u\n", runs, ufc);
+    FX_CHECK(ufc > 0);
 }

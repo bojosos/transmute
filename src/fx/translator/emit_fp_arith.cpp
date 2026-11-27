@@ -464,6 +464,16 @@ LaneGuard lane_guard(FpEmit& e) {
     return {e.gtmp(), false};
 }
 
+// host_flags_live() answers for the instruction's family as a whole: in a
+// multi-word family it describes the first word's flag reads and writes. Do
+// not use rare_guard inside a family that both writes and reads NZCV (none
+// does today): a later word's read would not be seen.
+LaneGuard rare_guard(FpEmit& e) {
+    if (e.ctx.host_flags_live()) return lane_guard(e);
+    e.ctx.clobber_host_flags();   // dead: nothing to save
+    return {e.gtmp(), false, true};
+}
+
 // ---- tininess before rounding (knob tinybefore) ----------------------------------------------
 // A64 FPRound signals Underflow when the exponent is too small before rounding
 // and the result is inexact; x64 tests the result rounded to the destination
@@ -476,45 +486,57 @@ LaneGuard lane_guard(FpEmit& e) {
 // larger value; IE, ZE and DE depend on the operands alone). Sums and
 // differences are exact near min_normal (every operand is a multiple of the
 // smallest denormal). Not covered: FMULX, FRECPS/FRSQRTS and half precision.
-// A result of exactly +-min_normal is rare: the common path is an AND, a
-// compare, a mask move and a not-taken branch; the slow path rewrites MXCSR
-// twice.
-void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm r, Xmm t0, Xmm t1,
+// A result of exactly +-min_normal is rare: the common path is an AND and a
+// compare into one vector temp, then PTEST/JCC when the host flags are dead,
+// else MOVMSKPS and JRCXZ over a near JMP (rare_guard); the slow path
+// rewrites MXCSR twice.
+void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm r, Xmm t0,
                        const LaneGuard& guard, const std::function<void(Xmm)>& compute) {
     auto& a = e.as;
     const bool dbl = es == 64;
     const std::uint64_t mag = FpEmit::abs_bits(es), min_normal = dbl ? 0x0010000000000000ull : 0x00800000ull;
-    e.op(dbl ? op::andpd : op::andps, t0, r, Opnd::at(scalar ? e.kscalar(es, mag) : e.ksplat(es, mag)));
+    // |r| in the lanes that matter, zero elsewhere (never equal to min_normal).
+    const std::uint64_t mag64 = dbl ? mag : mag | mag << 32;
+    const Mem lanes = scalar ? e.kscalar(es, mag) : width == 64 ? e.kconst(mag64, 0) : e.ksplat(es, mag);
+    e.op(dbl ? op::andpd : op::andps, t0, r, Opnd::at(lanes));
     e.op(dbl ? op::pcmpeqq : op::pcmpeqd, t0, t0, Opnd::at(e.ksplat(es, min_normal)));
-    if (scalar) {
-        if (dbl) e.movq(guard.reg, t0);
-        else e.movd(guard.reg, t0);
-    } else if (width == 64) {
-        e.movq(guard.reg, t0);
+    // The slow path can exceed rel8 (memory operands, pooled constants): near
+    // branches, and JRCXZ (host flags live) over a near jmp.
+    const auto done = a.new_label();
+    if (guard.ptest) {
+        e.un(op::ptest, t0, t0);
+        a.jcc(x64::Cond::e, done);
     } else {
         a.movmskps(guard.reg, t0);
+        if (guard.jrcxz) {
+            const auto fast = a.new_label(), slow = a.new_label();
+            a.jrcxz_short(fast);
+            a.jmp_short(slow);
+            a.bind(fast);
+            a.jmp(done);
+            a.bind(slow);
+        } else {
+            a.test(32, guard.reg, guard.reg);
+            a.jcc(x64::Cond::e, done);
+        }
     }
-    const auto done = a.new_label();
-    if (guard.jrcxz) {
-        a.jrcxz_short(done);
-    } else {
-        a.test(64, guard.reg, guard.reg);
-        a.jcc_short(x64::Cond::e, done);
-    }
-    // FPCR and FPSR (adjacent words) are the MXCSR scratch: kept in the guard
-    // GPR. Only moves and vector ops below: the host flags stay as they are.
+    // FPCR and FPSR (adjacent words) are the MXCSR scratch, kept in the guard
+    // GPR: the low word is ldmxcsr's operand, the high one keeps the original
+    // MXCSR (A) across the rerun. Only moves and vector ops below: the host
+    // flags stay as they are.
     const Mem slot = ctx_mem(kFpcrDisp);
     a.mov(64, guard.reg, slot);
     a.stmxcsr(slot);
-    e.un(op::movsd, t1, Opnd::at(slot));                                // MXCSR (and FPSR above)
-    e.op(op::orps, t0, t1, Opnd::at(e.kscalar(32, 0x6000)));            // RC = toward zero
-    a.movq(slot, t0);
+    e.un(op::movss, t0, Opnd::at(slot));
+    e.un_i(op::pshufd, t0, t0, 0x00);                                   // A in every lane
+    e.op(op::orps, t0, t0, Opnd::at(e.kconst(0x6000, 0)));              // lane 0: RC = toward zero
+    a.movq(slot, t0);                                                   // [A | RZ, A]
     a.ldmxcsr(slot);
     compute(t0);
-    a.stmxcsr(slot);
+    a.stmxcsr(slot);                                                    // [B, A]
     e.un(op::movsd, t0, Opnd::at(slot));
-    e.op(op::andps, t0, t0, Opnd::at(e.kscalar(32, 0x10)));             // UE from the rerun
-    e.op(op::orps, t0, t0, t1);                                         // the original mode and flags
+    e.op(op::andps, t0, t0, Opnd::at(e.kconst(0xffffffef00000010ull, 0)));   // B & UE, A & ~UE
+    e.op(op::phaddd, t0, t0, t0);                                       // lane 0: A | (B & UE)
     a.movq(slot, t0);
     a.ldmxcsr(slot);
     a.mov(64, slot, guard.reg);
@@ -530,16 +552,20 @@ bool emit_arith_tiny_before(FpEmit& e, const Inst& in) {
     if (fused && !e.feat.fma) return false;
     const bool dbl = s.dbl();
     const unsigned w = s.width();
-    e.allow_vec_temps(5);
     const Xmm a = e.vec(in.rn);
-    const Xmm b = in.index >= 0 ? element(e, s, in.rm, in.index) : e.vec(in.rm);
+    // The second factor or divisor may stay in memory (the rerun reads it
+    // again), unless it is also the destination: after dest() its guest
+    // register reads as written.
+    Opnd b = in.index >= 0 ? element_op(e, s, in.rm, in.index) : e.src(in.rm);
+    if (b.is_mem && in.rm == in.rd) b = Opnd::of(in.index >= 0 ? element(e, s, in.rm, in.index) : e.vec(in.rm));
     const bool acc = in.k == K::fmla || in.k == K::fmls;
     const Xmm c = !fused ? Xmm{} : e.vec(acc ? in.rd : in.ra);
-    // Every register before the first label: the guard GPR, the temps, Vd.
-    const auto guard = lane_guard(e);
-    const Xmm t0 = e.tmp(), t1 = e.tmp();
+    // Every register before the first label: the guard GPR, the temp, Vd.
+    const auto guard = rare_guard(e);
+    const Xmm t0 = e.tmp();
     const Xmm d = e.dest(in.rd);
-    const bool alias = d == a || d == b || (fused && d == c);   // the sources must survive the rerun
+    // The sources must survive the rerun.
+    const bool alias = d == a || (!b.is_mem && d == b.reg) || (fused && d == c);
     const Xmm T = alias ? e.tmp() : d;
     FmaKind kind = FmaKind::fmadd;   // FMADD a+n*m, FMSUB a-n*m, FNMADD -a-n*m, FNMSUB -a+n*m
     switch (in.k) {
@@ -563,7 +589,7 @@ bool emit_arith_tiny_before(FpEmit& e, const Inst& in) {
         }
     };
     compute(T);
-    tiny_before_fixup(e, s.es, s.scalar, w, T, t0, t1, guard, compute);
+    tiny_before_fixup(e, s.es, s.scalar, w, T, t0, guard, compute);
     if (alias) e.mov(d, T);
     // Scalar results take their upper lanes from the first source (the
     // addend for the fused forms); 64-bit vectors compute the upper lanes.

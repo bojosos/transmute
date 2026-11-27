@@ -98,6 +98,7 @@ inline constexpr SseOp cvtdq2pd{0xf3, 1, 0xe6}, cvttpd2dq{0x66, 1, 0xe6};
 inline constexpr SseOp ptest{0x66, 2, 0x17};
 inline constexpr SseOp pmovsxwd{0x66, 2, 0x23}, pmovzxwd{0x66, 2, 0x33};
 inline constexpr SseOp pcmpeqq{0x66, 2, 0x29}, packusdw{0x66, 2, 0x2b}, pcmpgtq{0x66, 2, 0x37};
+inline constexpr SseOp phaddd{0x66, 2, 0x02};
 inline constexpr SseOp pminsd{0x66, 2, 0x39}, pminud{0x66, 2, 0x3b}, pmaxsd{0x66, 2, 0x3d}, pmaxud{0x66, 2, 0x3f};
 inline constexpr SseOp pmulld{0x66, 2, 0x40};
 // map 3 (0F3A)
@@ -453,16 +454,21 @@ std::uint64_t expand_fp_imm(unsigned imm8, unsigned es);
 struct LaneGuard {
     Gp reg;
     bool jrcxz;
+    bool ptest = false;   // host flags dead: PTEST/JCC on the mask (reg is scratch for the taken path)
 };
 LaneGuard lane_guard(FpEmit& e);
+// The guard for code whose branch is rarely taken: when the host flags are
+// dead (EmitContext::host_flags_live), any scratch GPR with PTEST/JCC (no RCX
+// eviction); else lane_guard. Not for families that write and read NZCV.
+LaneGuard rare_guard(FpEmit& e);
 // Tininess before rounding (knob tinybefore). `r` holds the result just
 // computed by `compute(out)` (es-bit lanes; scalar: lane 0; else the low
 // `width` bits). When a lane of r is +-min_normal, compute is run again into
 // t0 toward zero, which sets MXCSR.UE exactly when A64 sets UFC; no other
 // flag changes. compute must leave its sources and r intact and use no
-// register besides `out` (it runs after a label). r, t0 and t1 are distinct
-// and differ from compute's sources.
-void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm r, Xmm t0, Xmm t1,
+// register besides `out` (it runs after a label). r and t0 are distinct and
+// differ from compute's sources.
+void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm r, Xmm t0,
                        const LaneGuard& guard, const std::function<void(Xmm)>& compute);
 // Vd = op(...) with the fixup above for FMUL, FDIV, FNMUL and the fused forms
 // (S/D shapes); false when the instruction is not one of them.
