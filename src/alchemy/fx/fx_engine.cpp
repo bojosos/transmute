@@ -998,14 +998,40 @@ struct FxEngine::Shared {
     }
     bool host_free(std::uint64_t base, std::uint64_t size) const {
         if (base + size <= kLowLimit) return true;
+        if (base + size > UINT64_MAX - (kGranule - 1)) return false;
         load_range::release_if_overlaps(base, size);
-        auto address = std::max(base, kLowLimit);
-        const auto end = base + size;
+        // Granule-aligned: reserve_granules claims whole 64 KiB granules, and
+        // on Linux host allocations can sit at 4 KiB boundaries inside one.
+        auto address = align_down(std::max(base, kLowLimit), kGranule);
+        const auto end = align_up(base + size, kGranule);
         while (address < end) {
             vm::RegionInfo info;
-            if (!vm::query(host(address), info)) return false;
+            if (!vm::query(host(address), info) || info.size == 0) return false;
             const auto region_end = info.base + info.size;
             if (info.state != vm::State::free && !ours(address)) return false;
+            address = region_end;
+        }
+        return true;
+    }
+    // Every enclosing 64 KiB granule of [base, base + size) is completely free
+    // on the host and not held by a private FxEngine reservation, so fx shared
+    // memory (which reserves placeholders by 64 KiB granule) can take it.
+    bool host_free_for_shared(std::uint64_t base, std::uint64_t size) const {
+        if (size == 0 || base < kLowLimit || base + size < base || base + size > UINT64_MAX - (kGranule - 1)) return false;
+        load_range::release_if_overlaps(base, size);
+        auto address = align_down(base, kGranule);
+        const auto end = align_up(base + size, kGranule);
+        while (address < end) {
+            if (ours(address)) return false;
+            vm::RegionInfo info;
+            if (!vm::query(host(address), info) || info.state != vm::State::free || info.size == 0) return false;
+            const auto region_end = info.base + info.size;
+            // ours() tracks 64 KiB granules; step by at most one granule if a
+            // large free region is checked, or skip past it when none of our
+            // granules intersect [address, min(end, region_end)).
+            const auto span_end = std::min(end, region_end);
+            const auto next_ours = granules.next(address / kGranule, (span_end + kGranule - 1) / kGranule);
+            if (next_ours * kGranule < span_end) return false;
             address = region_end;
         }
         return true;
@@ -2518,7 +2544,7 @@ void FxEngine::map_memory(std::uint64_t base, std::size_t size) {
     const auto begin = align_down(base, kPage);
     const auto end = align_up(base + size, kPage);
     shared_->reserve_granules(begin, end);
-    if (!commit(begin, end)) {
+    if (!shared_->make_private(begin, end) || !commit(begin, end)) {
         std::ostringstream message;
         message << "alchemy-fx: cannot commit guest range 0x" << std::hex << base << "+0x" << size
                 << " (error " << std::dec << fx::host::last_error() << ')';
@@ -2829,6 +2855,12 @@ bool FxEngine::is_range_available(std::uint64_t base, std::uint64_t size) const 
     if (size == 0 || base + size < base) return false;
     std::shared_lock lock(shared_->memory_lock);
     return !shared_->overlaps(base, size) && shared_->host_free(base, size);
+}
+
+bool FxEngine::is_shared_range_available(std::uint64_t base, std::uint64_t size) const {
+    if (size == 0 || base + size < base) return false;
+    std::shared_lock lock(shared_->memory_lock);
+    return !shared_->overlaps(base, size) && shared_->host_free_for_shared(base, size);
 }
 
 std::optional<GuestMemory::RegionInfo> FxEngine::query_region(std::uint64_t address) const {

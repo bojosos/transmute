@@ -348,6 +348,17 @@ void register_engine_image(Engine& engine, std::uint64_t header, std::uint64_t b
 // shared memory at `source` again at `destination` (free, or whole shared
 // regions it replaces); false when unsupported or refused.
 template <class Engine>
+constexpr bool engine_has_shared_memory = requires(Engine& engine) {
+    engine.map_shared_memory(std::uint64_t{}, std::uint64_t{}, std::uint64_t{});
+};
+template <class Engine>
+bool engine_is_shared_range_available(const Engine& engine, std::uint64_t base, std::uint64_t size) {
+    if constexpr (requires { engine.is_shared_range_available(base, size); })
+        return engine.is_shared_range_available(base, size);
+    else
+        return engine.is_range_available(base, size);
+}
+template <class Engine>
 bool engine_map_shared_memory(Engine& engine, std::uint64_t base, std::uint64_t size, std::uint64_t granule) {
     if constexpr (requires { engine.map_shared_memory(base, size, granule); }) {
         try {

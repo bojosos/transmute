@@ -155,6 +155,62 @@ int main(void) {
         if (vm_deallocate(task, src, PAGE) != 0 || vm_deallocate(task, dst, PAGE) != 0 ||
             vm_deallocate(task, over, PAGE) != 0) return 41;
     }
+    /* Shared allocations (VM_FLAGS_ANYWHERE) and wide-aligned mach_vm_map must
+     * skip 64 KiB granules partly occupied by a private mmap reservation instead
+     * of degrading to unshareable private memory, and a fixed vm_allocate
+     * spanning a private granule and a guest-space placeholder must commit cleanly. */
+    {
+        vm_address_t probe = 0;
+        if (vm_allocate(task, &probe, PAGE, ANYWHERE) != 0) return 49;
+        if (vm_deallocate(task, probe, PAGE) != 0) return 50;
+        const unsigned long granule = 0x10000ul;
+        const unsigned long block = (probe + granule) & ~(granule - 1);
+        char* priv = (char*)mmap((void*)block, PAGE, READ | WRITE,
+                                 0x1012 /* MAP_PRIVATE | MAP_ANON | MAP_FIXED */, -1, 0);
+        if (priv != (char*)block) return 51;
+        ((volatile unsigned*)priv)[0] = 0x314159;
+        vm_address_t s1 = 0, s2 = 0, a1 = 0, a2 = 0;
+        if (vm_allocate(task, &s1, PAGE, ANYWHERE) != 0) return 52;
+        if (vm_allocate(task, &s2, PAGE, ANYWHERE) != 0) return 53;
+        if ((s1 >= block && s1 < block + granule) || (s2 >= block && s2 < block + granule)) return 54;
+        ((volatile unsigned*)s1)[0] = 0x1111;
+        ((volatile unsigned*)s2)[0] = 0x2222;
+        if (vm_remap(task, &a1, PAGE, 0, ANYWHERE, task, s1, 0, &current, &maximum, 0) != 0) return 55;
+        if (vm_remap(task, &a2, PAGE, 0, ANYWHERE, task, s2, 0, &current, &maximum, 0) != 0) return 56;
+        ((volatile unsigned*)a1)[1] = 0xaaaa;
+        ((volatile unsigned*)a2)[1] = 0xbbbb;
+        if (((volatile unsigned*)s1)[1] != 0xaaaa || ((volatile unsigned*)s2)[1] != 0xbbbb) return 57;
+        unsigned long entry_size = PAGE;
+        mach_port_t entry = 0;
+        if (mach_make_memory_entry_64(task, &entry_size, 0, 0x20003 /* MAP_MEM_NAMED_CREATE | RW */, &entry, 0) != 0) return 58;
+        unsigned long aligned = 0, check = 0;
+        const unsigned long mask = 0x1fffful; /* 128 KiB alignment */
+        if (mach_vm_map(task, &aligned, PAGE, mask, ANYWHERE, entry, 0, 0, READ | WRITE, READ | WRITE, 1) != 0) return 59;
+        if ((aligned & mask) != 0) return 60;
+        ((volatile unsigned*)aligned)[2] = 0xfeedfaceu;
+        if (mach_vm_map(task, &check, PAGE, 0, ANYWHERE, entry, 0, 0, READ, READ, 1) != 0) return 61;
+        if (((volatile unsigned*)check)[2] != 0xfeedfaceu) return 62;
+        if (vm_deallocate(task, check, PAGE) != 0 || vm_deallocate(task, aligned, PAGE) != 0) return 63;
+        mach_port_deallocate(task, entry);
+        if (vm_deallocate(task, a1, PAGE) != 0 || vm_deallocate(task, a2, PAGE) != 0 ||
+            vm_deallocate(task, s1, PAGE) != 0 || vm_deallocate(task, s2, PAGE) != 0) return 64;
+        if (((volatile unsigned*)priv)[0] != 0x314159 || munmap(priv, PAGE) != 0) return 65;
+
+        const unsigned long gs_size = 16ul << 20;
+        char* gs = (char*)mmap(0, gs_size, 0 /* PROT_NONE */, 0x1002 /* MAP_PRIVATE | MAP_ANON */, -1, 0);
+        if (gs == (char*)-1) return 66;
+        if (mprotect(gs + (4ul << 20), PAGE, READ | WRITE) != 0) return 67;
+        ((volatile unsigned*)(gs + (4ul << 20)))[0] = 0x4242;
+        const vm_address_t hole = (vm_address_t)(gs + (4ul << 20) + PAGE);
+        if (munmap((void*)hole, granule) != 0) return 68;
+        vm_address_t fixed_hole = hole;
+        if (vm_allocate(task, &fixed_hole, granule, 0 /* FIXED */) != 0 || fixed_hole != hole) return 69;
+        ((volatile unsigned*)fixed_hole)[0] = 0x1357;
+        ((volatile unsigned*)(fixed_hole + granule - 4))[0] = 0x2468;
+        if (((volatile unsigned*)(gs + (4ul << 20)))[0] != 0x4242) return 70;
+        if (vm_deallocate(task, fixed_hole, granule) != 0) return 71;
+        if (munmap(gs, gs_size) != 0) return 72;
+    }
     puts("fx vm_remap: ok");
     return 0;
 }

@@ -134,6 +134,11 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         std::fprintf(stderr, "alchemy: %s\n", message.c_str());
     }
 
+    static constexpr std::uint64_t shared_granule = 0x10000;
+    static std::uint64_t align_up_granule(std::uint64_t value) {
+        return value > UINT64_MAX - (shared_granule - 1) ? 0 : (value + shared_granule - 1) & ~(shared_granule - 1);
+    }
+
     std::uint32_t allocate(transmute::CpuState& state, transmute::GuestMemory& memory) {
         if (!task(state.x[0])) return invalid_task;
         const auto output = state.x[1], size = state.x[2];
@@ -150,6 +155,34 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         std::lock_guard lock(metadata);
         if (pages.size() > (resident_limit - extent) / page_size) return resource_shortage;
         auto& engine = process.calling_engine();
+        using Engine = std::remove_reference_t<decltype(engine)>;
+        if ((flags & anywhere) && engine_has_shared_memory<Engine>) {
+            // Engines with shared guest memory reserve 64 KiB host placeholder
+            // granules. Pick a 64 KiB-aligned range whose granules are free
+            // (never inside a private reservation or a 4 KiB Linux host mapping)
+            // and retry if another thread claims a granule concurrently, so
+            // VM_FLAGS_ANYWHERE never silently degrades to unshareable memory.
+            const auto step = align_up_granule(extent + page_size);
+            if (!step) return no_space;
+            begin = align_up_granule(next_address);
+            if (!begin) return no_space;
+            for (int attempt = 0; attempt < 64; ++attempt) {
+                while (!engine_is_shared_range_available(engine, begin, extent)) {
+                    if (begin > UINT64_MAX - step) return no_space;
+                    begin += step;
+                }
+                if (engine_map_shared_memory(engine, begin, extent, page_size)) {
+                    for (auto offset = std::uint64_t{}; offset < extent; offset += page_size) pages.emplace(begin + offset, Page{});
+                    memory.write64(output, begin);
+                    next_address = begin <= UINT64_MAX - step ? begin + step : begin;
+                    if (flags & purgable) purgeable[begin] = Purgeable{extent};
+                    return success;
+                }
+                if (begin > UINT64_MAX - step) return no_space;
+                begin += step;
+            }
+            return no_space;
+        }
         if (flags & anywhere) {
             begin = next_address;
             while (!engine.is_range_available(begin, extent)) {
@@ -227,11 +260,33 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         std::lock_guard lock(metadata);
         auto& engine = process.calling_engine();
         if (!address) {
-            begin = next_address;
-            while (!engine.is_range_available(begin, extent)) {
-                if (begin > UINT64_MAX - extent - page_size) return no_space;
-                begin += extent + page_size;
+            const auto step = align_up_granule(extent + page_size);
+            if (!step) return no_space;
+            begin = align_up_granule(next_address);
+            if (!begin) return no_space;
+            bool mapped = false;
+            for (int attempt = 0; attempt < 64; ++attempt) {
+                while (!engine_is_shared_range_available(engine, begin, extent)) {
+                    if (begin > UINT64_MAX - step) return no_space;
+                    begin += step;
+                }
+                try {
+                    if (!engine_map_section_pages(engine, begin, extent, section, offset, page_size, writable_section,
+                                                  (protection & read) != 0, (protection & write) != 0))
+                        return not_supported;
+                    mapped = true;
+                    break;
+                } catch (const std::runtime_error&) {
+                    if (begin > UINT64_MAX - step) return no_space;
+                    begin += step;
+                }
             }
+            if (!mapped) return no_space;
+            const Page permissions{protection & (read | write), maximum};
+            for (auto at = begin; at < begin + extent; at += page_size) pages[at] = permissions;
+            next_address = begin <= UINT64_MAX - step ? begin + step : begin;
+            address = begin;
+            return success;
         } else if (replace) {
             for (auto at = begin; at < begin + extent; at += page_size)
                 if (!pages.contains(at) && !engine.is_range_available(at, page_size)) return no_space;
@@ -251,7 +306,6 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         }
         const Page permissions{protection & (read | write), maximum};
         for (auto at = begin; at < begin + extent; at += page_size) pages[at] = permissions;
-        if (!address) next_address = begin + extent + page_size;
         address = begin;
         return success;
     }
@@ -520,30 +574,44 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         auto& engine = process.calling_engine();
         if (copy) return remap_copy(state, memory, begin, extent, flags, mach_target, executable, current_output, maximum_output, refuse);
         if (mach_target && engine_is_shared_memory(engine, begin, extent)) {
-            std::uint64_t target = memory.read64(state.x[1]);
-            if (flags & anywhere) {
-                target = next_address;
-                while (!engine.is_range_available(target, extent)) {
-                    if (target > UINT64_MAX - extent - page_size) return no_space;
-                    target += extent + page_size;
-                }
-            }
             const auto source_page = pages.find(begin);
             const Page permissions = source_page != pages.end() ? source_page->second : Page{};
-            if (engine_alias_memory(engine, target, begin, extent, (permissions.current & read) != 0,
-                                    (permissions.current & write) != 0, (permissions.current & execute) != 0)) {
+            const auto finish_alias = [&](std::uint64_t target, std::uint64_t next) {
                 for (auto offset = std::uint64_t{}; offset < extent; offset += page_size) {
                     const auto from = pages.find(begin + offset);
                     pages[target + offset] = from != pages.end() ? from->second : permissions;
                 }
                 if (flags & anywhere) {
                     memory.write64(state.x[1], target);
-                    next_address = target + extent + page_size;
+                    next_address = next;
                 }
                 memory.write32(current_output, permissions.current);
                 memory.write32(maximum_output, permissions.maximum);
                 return success;
+            };
+            if (flags & anywhere) {
+                const auto step = align_up_granule(extent + page_size);
+                if (!step) return no_space;
+                std::uint64_t target = align_up_granule(next_address);
+                if (!target) return no_space;
+                for (int attempt = 0; attempt < 64; ++attempt) {
+                    while (!engine_is_shared_range_available(engine, target, extent)) {
+                        if (target > UINT64_MAX - step) return no_space;
+                        target += step;
+                    }
+                    if (engine_alias_memory(engine, target, begin, extent, (permissions.current & read) != 0,
+                                            (permissions.current & write) != 0, (permissions.current & execute) != 0))
+                        return finish_alias(target, target <= UINT64_MAX - step ? target + step : target);
+                    if (target > UINT64_MAX - step) return no_space;
+                    target += step;
+                }
+                return no_space;
             }
+            const std::uint64_t target = memory.read64(state.x[1]);
+            if (engine_alias_memory(engine, target, begin, extent, (permissions.current & read) != 0,
+                                    (permissions.current & write) != 0, (permissions.current & execute) != 0))
+                return finish_alias(target, next_address);
+            if ((flags & overwrite) == 0) return no_space;
         }
         // Shared memory over mmap'd pages (Chrome maps shared memory into V8's
         // sandbox this way, a GPU command buffer's ring buffer among it): a real

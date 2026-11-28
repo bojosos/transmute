@@ -87,6 +87,7 @@ public:
     // and the pages live while any region maps them. unmap_memory and
     // set_memory_access work on these regions as on any other.
     void map_shared_memory(std::uint64_t base, std::uint64_t size, std::uint64_t granule);
+    [[nodiscard]] bool is_shared_range_available(std::uint64_t base, std::uint64_t size) const;
     [[nodiscard]] bool is_shared_memory(std::uint64_t base, std::uint64_t size) const;
     void alias_memory(std::uint64_t destination, std::uint64_t source, std::uint64_t size, bool readable,
                       bool writable, bool executable);

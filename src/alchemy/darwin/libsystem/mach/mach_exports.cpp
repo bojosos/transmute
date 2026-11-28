@@ -1347,20 +1347,46 @@ void MachProvider::install_memory_entries() {
         if (!size || (offset & page_mask) || offset > entry->size || length > entry->size - offset) { s.x[0] = kern::invalid_argument; return; }
         const auto source = entry->backing->anchor + entry->offset + offset;
         Address target = m.read64(s.x[1]);
-        auto remap_flags = flags;
-        if ((flags & vm_flags_anywhere) && mask > page_mask) {
-            // An alignment wider than a page: find aligned free space.
+        std::uint32_t result = kern::no_space;
+        if (!copy && (flags & vm_flags_anywhere) && mask > page_mask) {
+            // An alignment wider than a page: find aligned free space whose
+            // host granules are free for shared aliases, retrying if another
+            // thread takes a candidate before vm_remap claims it.
             const auto alignment = mask + 1;
+            if (!alignment || (alignment & mask) != 0) { s.x[0] = kern::invalid_argument; return; }
             auto& engine = process.calling_engine();
             Address candidate = (0x900000000ULL + mask) & ~mask;
-            for (int attempt = 0; attempt < 65536 && !engine.is_range_available(candidate, length); ++attempt) candidate += alignment;
-            if (!engine.is_range_available(candidate, length)) { s.x[0] = kern::no_space; return; }
-            target = candidate;
-            remap_flags = 0;
-        }
-        std::uint32_t result;
-        if (copy) {
+            int attempts = 0;
+            for (int placed = 0; placed < 64 && attempts < 65536; ++placed) {
+                while (attempts < 65536 && !engine_is_shared_range_available(engine, candidate, length)) {
+                    if (candidate > UINT64_MAX - alignment) { attempts = 65536; break; }
+                    candidate += alignment;
+                    ++attempts;
+                }
+                if (attempts >= 65536) break;
+                target = candidate;
+                result = vm_remap(target, length, 0, source);
+                if (result != kern::no_space) break;
+                if (candidate > UINT64_MAX - alignment) break;
+                candidate += alignment;
+                ++attempts;
+            }
+        } else if (copy) {
             // A private copy of the entry's current contents.
+            auto remap_flags = flags;
+            if ((flags & vm_flags_anywhere) && mask > page_mask) {
+                const auto alignment = mask + 1;
+                if (!alignment || (alignment & mask) != 0) { s.x[0] = kern::invalid_argument; return; }
+                auto& engine = process.calling_engine();
+                Address candidate = (0x900000000ULL + mask) & ~mask;
+                for (int attempt = 0; attempt < 65536 && !engine.is_range_available(candidate, length); ++attempt) {
+                    if (candidate > UINT64_MAX - alignment) { s.x[0] = kern::no_space; return; }
+                    candidate += alignment;
+                }
+                if (!engine.is_range_available(candidate, length)) { s.x[0] = kern::no_space; return; }
+                target = candidate;
+                remap_flags = 0;
+            }
             target = remap_flags & vm_flags_anywhere ? 0 : target;
             const auto slot = process.allocate_guest(8);
             m.write64(slot, target);
@@ -1373,7 +1399,7 @@ void MachProvider::install_memory_entries() {
                 m.write_bytes(target, bytes);
             }
         } else {
-            result = vm_remap(target, length, remap_flags, source);
+            result = vm_remap(target, length, flags, source);
         }
         if (result) { s.x[0] = result; return; }
         if (current != (vm_prot_read | vm_prot_write)) result = vm_protect(target, length, false, current);
