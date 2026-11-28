@@ -128,9 +128,9 @@ void boolean_properties(Provider& p, Address target, std::initializer_list<std::
     }
 }
 
-// CATapDescription: which processes a process tap would capture, and how. Every initializer
-// gives the description a new UUID; no tap can be created from one (see
-// AudioHardwareCreateProcessTap).
+// CATapDescription: which processes a process tap captures, and how. Every initializer
+// gives the description a new UUID; AudioHardwareCreateProcessTap (hal.cpp) turns one
+// into a HAL tap object.
 void install_tap_description(Provider& p) {
     const auto tap = p.cls(core_audio, "CATapDescription", "NSObject");
     p.object_properties(tap, {"name", "UUID", "processes", "deviceUID", "stream"});
@@ -453,16 +453,8 @@ void Provider::install_media() {
     install_capture_photo(*this);
 
     // ---------------------------------------------------------------- CoreAudio, AudioToolbox
-    failure(core_audio, "_AudioHardwareCreateAggregateDevice", audio_unsupported_operation);
-    failure(core_audio, "_AudioHardwareDestroyAggregateDevice", audio_bad_device);
     // OSStatus AudioDeviceDuck(AudioObjectID, Float32 duckedLevel, const AudioTimeStamp *startTime, Float32 rampDuration)
     failure(core_audio, "_AudioDeviceDuck", audio_unsupported_operation);
-    // OSStatus AudioHardwareCreateProcessTap(CATapDescription *, AudioObjectID *outTapID): kAudioObjectUnknown.
-    raw(core_audio, "_AudioHardwareCreateProcessTap", [](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) m.write32(s.x[1], 0);
-        s.x[0] = status(audio_unsupported_operation);
-    });
-    failure(core_audio, "_AudioHardwareDestroyProcessTap", audio_bad_object);   // no tap exists
     install_tap_description(*this);
 
     // ---------------------------------------------------------------- GameController

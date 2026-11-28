@@ -46,6 +46,26 @@ inline constexpr std::int32_t not_running = static_cast<std::int32_t>(four("stop
 inline constexpr std::uint32_t system_object = 1;
 inline constexpr std::uint32_t scope_global = four("glob"), scope_input = four("inpt"), scope_output = four("outp");
 
+struct LoopbackTarget {
+    std::uint32_t process_id{};        // host process id (this process when 0)
+    bool include{true};                // true: that process tree only; false: everything else
+};
+
+struct ProcessInfo {
+    std::uint32_t guest_pid{};
+    std::uint32_t host_pid{};
+    std::string bundle_id;
+};
+
+struct TapSpec {
+    std::string uid;
+    std::uint64_t description{};       // retained guest CATapDescription*
+    std::uint32_t channels{2};
+    double sample_rate{48000};
+    LoopbackTarget target;
+    bool is_private{};
+};
+
 struct Device {
     std::string uid, name, manufacturer;
     bool input{};                      // capture endpoint (else render)
@@ -53,6 +73,10 @@ struct Device {
     double sample_rate{48000};
     std::uint32_t channel_mask{};      // WAVEFORMATEXTENSIBLE dwChannelMask (0 = unknown)
     std::uint32_t form_factor{};       // EndpointFormFactor (0 = remote network device, 10 = unknown)
+    bool aggregate{};                  // tap aggregate device (AudioHardwareCreateAggregateDevice)
+    bool is_private{};                 // omitted from kAudioHardwarePropertyDevices
+    std::optional<LoopbackTarget> loopback;
+    std::vector<std::string> tap_uids;
 };
 
 struct Snapshot {
@@ -93,50 +117,88 @@ public:
     // An input stream on `device` (an input device of the snapshot), or nullptr (none, or the host's
     // privacy settings deny the microphone).
     virtual std::unique_ptr<InputStream> open_input(const Device&, Capture) { return nullptr; }
+    // A process-loopback input stream for a CoreAudio process tap aggregate device, or nullptr.
+    virtual std::unique_ptr<InputStream> open_loopback(const LoopbackTarget&, double /*sample_rate*/, std::uint32_t /*channels*/, Capture) { return nullptr; }
 };
 
 struct Address {
     std::uint32_t selector{}, scope{scope_global}, element{};
 };
 
-// A property value: raw bytes, or a CFString the guest layer creates (+1).
+struct Qualifier {
+    std::optional<std::string> string;
+    std::optional<std::int32_t> pid;
+};
+
+// A property value: raw bytes, a CFString the guest layer creates (+1), or an ObjC object (+1).
 struct Value {
     std::vector<std::uint8_t> bytes;
     std::optional<std::string> string;
+    std::optional<std::uint64_t> object;
     std::uint32_t element_size{};      // > 0: an array that may be truncated to whole elements
 };
 
-enum class Kind { system, device, stream };
+enum class Kind { system, device, stream, process, tap };
 
 class Model {
 public:
-    explicit Model(Snapshot snapshot);
+    using ProcessLookup = std::function<std::optional<ProcessInfo>(std::uint32_t guest_pid)>;
+
+    explicit Model(Snapshot snapshot, std::vector<ProcessInfo> initial_processes = {}, ProcessLookup process_lookup = {});
 
     [[nodiscard]] std::optional<Kind> kind(std::uint32_t object) const;
     [[nodiscard]] std::optional<std::uint32_t> device_for_uid(const std::string& uid) const;
     [[nodiscard]] const Device* device(std::uint32_t object) const;
     [[nodiscard]] std::vector<std::uint32_t> devices() const { return device_ids_; }
 
+    // Process objects (guest pid -> HAL process AudioObjectID).
+    [[nodiscard]] std::uint32_t translate_pid(std::uint32_t guest_pid);
+    [[nodiscard]] const ProcessInfo* process(std::uint32_t object) const;
+
+    // Process taps (AudioHardwareCreateProcessTap / DestroyProcessTap).
+    [[nodiscard]] std::uint32_t add_tap(TapSpec spec);
+    [[nodiscard]] std::optional<TapSpec> tap(std::uint32_t object) const;
+    [[nodiscard]] std::optional<TapSpec> tap_for_uid(const std::string& uid) const;
+    [[nodiscard]] std::optional<std::uint64_t> remove_tap(std::uint32_t object);
+    [[nodiscard]] std::vector<std::uint64_t> tap_descriptions() const;
+
+    // Tap-only aggregate devices (AudioHardwareCreateAggregateDevice / DestroyAggregateDevice).
+    [[nodiscard]] std::uint32_t add_aggregate_device(Device device);
+    [[nodiscard]] bool remove_aggregate_device(std::uint32_t object);
+
     // AudioObjectHasProperty / IsPropertySettable / GetPropertyDataSize / GetPropertyData /
-    // SetPropertyData. `qualifier` is the UID string of kAudioHardwarePropertyTranslateUIDToDevice.
+    // SetPropertyData.
     [[nodiscard]] bool has(std::uint32_t object, const Address& address) const;
     std::int32_t settable(std::uint32_t object, const Address& address, bool& out) const;
-    std::int32_t get(std::uint32_t object, const Address& address, const std::optional<std::string>& qualifier, Value& out) const;
+    std::int32_t get(std::uint32_t object, const Address& address, const Qualifier& qualifier, Value& out) const;
+    std::int32_t get(std::uint32_t object, const Address& address, const std::optional<std::string>& qualifier, Value& out) const {
+        return get(object, address, Qualifier{qualifier, std::nullopt}, out);
+    }
     std::int32_t set(std::uint32_t object, const Address& address, const std::vector<std::uint8_t>& data);
 
 private:
     struct Entry { std::uint32_t id{}, stream{}; Device device; std::uint32_t buffer_frames{512}; };
+    struct ProcessEntry { std::uint32_t id{}; ProcessInfo info; };
+    struct TapEntry { std::uint32_t id{}; TapSpec spec; };
     [[nodiscard]] const Entry* entry_for_device(std::uint32_t object) const;
     [[nodiscard]] const Entry* entry_for_stream(std::uint32_t object) const;
-    std::int32_t system_get(const Address& address, const std::optional<std::string>& qualifier, Value& out) const;
+    [[nodiscard]] const ProcessEntry* entry_for_process(std::uint32_t object) const;
+    [[nodiscard]] const TapEntry* entry_for_tap(std::uint32_t object) const;
+    std::int32_t system_get(const Address& address, const Qualifier& qualifier, Value& out) const;
     std::int32_t device_get(const Entry& entry, const Address& address, Value& out) const;
     std::int32_t stream_get(const Entry& entry, const Address& address, Value& out) const;
+    std::int32_t process_get(const ProcessEntry& entry, const Address& address, Value& out) const;
+    std::int32_t tap_get(const TapEntry& entry, const Address& address, Value& out) const;
 
     Snapshot snapshot_;
+    ProcessLookup process_lookup_;
+    std::uint32_t next_id_{};
     std::uint64_t run_loop_{};          // kAudioHardwarePropertyRunLoop (NULL: the HAL's own thread)
     bool sleeping_allowed_{true};
     std::vector<Entry> entries_;
     std::vector<std::uint32_t> device_ids_;
+    std::vector<ProcessEntry> processes_;
+    std::vector<TapEntry> taps_;
 };
 
 // Bytes of an AudioStreamBasicDescription for interleaved 32-bit float.

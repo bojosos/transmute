@@ -132,9 +132,26 @@ channel count and rate into their enqueued buffers. AVFoundation capture and AVA
 node open their own streams. Without an input device these fail as documented
 (`kAudioUnitErr_FailedInitialization`, `kAudioUnitErr_NoConnection`, `kAudioQueueErr_InvalidDevice`).
 
+**CoreAudio process taps (real, `hal.cpp`, `hal_core.cpp`, `hal_host.cpp`):**
+`kAudioHardwarePropertyProcessObjectList` and `kAudioHardwarePropertyTranslatePIDToProcessObject`
+expose HAL process objects (`kAudioProcessClassID`) for this process and other live Alchemy
+processes in the process tree (`kAudioProcessPropertyPID`, `kAudioProcessPropertyBundleID`).
+`AudioHardwareCreateProcessTap` / `AudioHardwareDestroyProcessTap` turn a `CATapDescription`
+(mono or stereo mixdown of one process tree, or global exclusive tap) into a HAL tap object
+(`kAudioTapPropertyUID`, `kAudioTapPropertyDescription`, `kAudioTapPropertyFormat`, 48 kHz float).
+`AudioHardwareCreateAggregateDevice` / `AudioHardwareDestroyAggregateDevice` support tap-only
+aggregate devices (`kAudioAggregateDeviceTapListKey`, optional main sub-device,
+`kAudioAggregateDeviceIsPrivateKey`), whose IOProcs and AUHAL input capture through
+`host::audio::open_loopback` (WASAPI process loopback on Windows; silent in cloaked runs unless
+`ALCHEMY_AUDIO_INPUT=device`, and unsupported on Linux/null). Muting the tapped process
+(`CATapMuted` and `CATapMutedWhenTapped`) is explicitly refused with
+`kAudioHardwareUnsupportedOperationError`, because Windows process loopback cannot silence the
+source process; multi-process taps, per-device stream taps, and aggregate devices of real
+sub-devices are likewise refused with `kAudioHardwareUnsupportedOperationError`.
+
 **Unavailable, as documented (audio):** version 3 audio
 units (AUAudioUnit), other components (`AudioComponentRegister` registers none),
-aggregate devices and process taps. Block IOProcs run on the I/O thread, not their queue.
+real-subdevice aggregate devices and audio ducking. Block IOProcs run on the I/O thread, not their queue.
 
 **Host dependencies:** `host::audio` (endpoints, output and capture streams, the microphone
 privacy setting; WASAPI / MMDevice on win32), `host::camera` (Media Foundation on win32),

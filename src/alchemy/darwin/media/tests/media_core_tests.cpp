@@ -326,6 +326,55 @@ void hal_tests() {
     hal::Model empty(hal::Snapshot{});
     require(empty.get(hal::system_object, {four("dev#")}, std::nullopt, v) == 0 && v.bytes.empty(), "no devices");
     require(empty.get(hal::system_object, {four("dOut")}, std::nullopt, v) == 0 && u32(v) == 0, "no default");
+
+    // Process objects, taps and tap-only aggregate devices.
+    hal::Model tapped(snapshot, {hal::ProcessInfo{101, 2001, "com.example.self"}},
+                      [](std::uint32_t pid) -> std::optional<hal::ProcessInfo> {
+                          if (pid == 202) return hal::ProcessInfo{202, 2002, "com.example.child"};
+                          return std::nullopt;
+                      });
+    require(tapped.get(hal::system_object, {four("prs#")}, std::nullopt, v) == 0 && v.bytes.size() == 4, "initial process object");
+    const auto self_proc = u32(v, 0);
+    require(tapped.kind(self_proc) == hal::Kind::process, "process kind");
+    require(tapped.get(self_proc, {four("clas")}, std::nullopt, v) == 0 && u32(v) == four("clnt"), "process class");
+    require(tapped.get(self_proc, {four("ppid")}, std::nullopt, v) == 0 && u32(v) == 101, "process guest pid");
+    require(tapped.get(self_proc, {four("pbid")}, std::nullopt, v) == 0 && v.string == "com.example.self", "process bundle id");
+    require(tapped.get(hal::system_object, {four("id2p")}, hal::Qualifier{std::nullopt, 101}, v) == 0 && u32(v) == self_proc, "translate self pid");
+    require(tapped.get(hal::system_object, {four("id2p")}, hal::Qualifier{}, v) == hal::error::bad_size, "missing pid qualifier");
+    const auto child_proc = tapped.translate_pid(202);
+    require(child_proc != 0 && tapped.translate_pid(202) == child_proc && tapped.translate_pid(999) == 0, "dynamic process lookup");
+    require(tapped.process(child_proc) && tapped.process(child_proc)->host_pid == 2002, "child host pid");
+    require(tapped.get(hal::system_object, {four("prs#")}, std::nullopt, v) == 0 && v.bytes.size() == 8, "both processes listed");
+
+    const auto public_tap = tapped.add_tap({"tap-uid-1", 0x1234, 2, 48000, {2002, true}, false});
+    const auto private_tap = tapped.add_tap({"tap-uid-2", 0x5678, 1, 48000, {0, false}, true});
+    require(tapped.kind(public_tap) == hal::Kind::tap && tapped.kind(private_tap) == hal::Kind::tap, "tap kinds");
+    require(tapped.get(hal::system_object, {four("tps#")}, std::nullopt, v) == 0 && v.bytes.size() == 4 && u32(v) == public_tap, "public tap list hides private");
+    require(tapped.get(hal::system_object, {four("uidt")}, std::string("tap-uid-2"), v) == 0 && u32(v) == private_tap, "translate private tap UID");
+    require(tapped.get(public_tap, {four("clas")}, std::nullopt, v) == 0 && u32(v) == four("tapy"), "tap class");
+    require(tapped.get(public_tap, {four("tuid")}, std::nullopt, v) == 0 && v.string == "tap-uid-1", "tap UID");
+    require(tapped.get(public_tap, {four("tdsc")}, std::nullopt, v) == 0 && v.object == 0x1234, "tap description object");
+    require(tapped.get(private_tap, {four("tfmt")}, std::nullopt, v) == 0 && v.bytes.size() == 40 && u32(v, 7) == 1, "mono tap format");
+
+    hal::Device agg;
+    agg.uid = "agg-uid-1";
+    agg.name = "Tap Aggregate";
+    agg.input = true;
+    agg.channels = 2;
+    agg.sample_rate = 48000;
+    agg.aggregate = true;
+    agg.is_private = true;
+    agg.loopback = hal::LoopbackTarget{2002, true};
+    agg.tap_uids = {"tap-uid-1"};
+    const auto agg_id = tapped.add_aggregate_device(agg);
+    require(tapped.kind(agg_id) == hal::Kind::device, "aggregate device kind");
+    require(tapped.get(hal::system_object, {four("dev#")}, std::nullopt, v) == 0 && v.bytes.size() == 12, "private aggregate hidden from dev#");
+    require(tapped.get(hal::system_object, {four("uidd")}, std::string("agg-uid-1"), v) == 0 && u32(v) == agg_id, "private aggregate found by UID");
+    require(tapped.get(agg_id, {four("clas")}, std::nullopt, v) == 0 && u32(v) == four("aagg"), "aggregate class");
+    require(tapped.get(agg_id, {four("tran")}, std::nullopt, v) == 0 && u32(v) == four("grup"), "aggregate transport");
+    require(tapped.get(agg_id, {four("hidn")}, std::nullopt, v) == 0 && u32(v) == 1, "private aggregate is hidden");
+    require(!tapped.remove_aggregate_device(speakers) && tapped.remove_aggregate_device(agg_id) && !tapped.kind(agg_id), "remove aggregate only");
+    require(tapped.remove_tap(public_tap) == 0x1234 && !tapped.kind(public_tap), "remove tap returns description");
 }
 
 } // namespace

@@ -421,7 +421,7 @@ void accessibility(Fixture& f) {
 }
 
 // The CMAttachmentBearer calls on a sample buffer and a CVPixelBuffer; the VideoToolbox
-// quality-metric keys; CoreAudio's ducking and process taps, which answer as unsupported;
+// quality-metric keys; CoreAudio's ducking (unsupported) and process-tap parameter checks;
 // CATapDescription and AVCapturePhotoSettings as value classes.
 void bearers_and_taps(Fixture& f) {
     const auto sample_out = f.block(8);
@@ -454,8 +454,8 @@ void bearers_and_taps(Fixture& f) {
     const auto tap_id = f.block(4);
     f.engine.write32(tap_id, 77);
     require(static_cast<std::uint32_t>(f.status(ca, "_AudioDeviceDuck", {1})) == fourcc("unop"), "no ducking");
-    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareCreateProcessTap", {0, tap_id})) == fourcc("unop") && f.engine.read32(tap_id) == 0,
-            "no process tap");
+    require(f.status(ca, "_AudioHardwareCreateProcessTap", {0, tap_id}) == -50 && f.engine.read32(tap_id) == 0,
+            "null tap description fails with paramErr");
     require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareDestroyProcessTap", {1})) == fourcc("!obj"), "no tap to destroy");
     const std::array<std::uint64_t, 1> pids{f.cf.integer(42)};
     const auto processes = f.cf.array(pids);

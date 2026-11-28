@@ -90,15 +90,16 @@ struct FakeOutput final : hal::OutputStream {
     }
 };
 
-// Captures 10 ms of 0.25 every 10 ms while running.
+// Captures 10 ms of `level` in `channels` every 10 ms while running.
 struct FakeInput final : hal::InputStream {
-    explicit FakeInput(hal::Capture capture) : capture(std::move(capture)) { ++live(); }
+    explicit FakeInput(hal::Capture capture, std::uint32_t channels = 1, float level = 0.25f)
+        : capture(std::move(capture)), channels(channels), level(level) { ++live(); }
     ~FakeInput() override { stop(); --live(); }
     bool start() override {
         if (thread.joinable()) return true;
         running = true;
         thread = std::thread([this] {
-            const std::vector<float> samples(480, 0.25f);
+            const std::vector<float> samples(480ULL * channels, level);
             while (running) {
                 capture(samples.data(), 480, alchemy::host::time::monotonic_ns());
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -111,11 +112,22 @@ struct FakeInput final : hal::InputStream {
         if (thread.joinable()) thread.join();
     }
     hal::Capture capture;
+    std::uint32_t channels{1};
+    float level{0.25f};
     std::atomic<bool> running{};
     std::thread thread;
     static std::atomic<int>& live() { static std::atomic<int> value{0}; return value; }
     static std::atomic<bool>& refuse() { static std::atomic<bool> value{false}; return value; }
 };
+
+struct FakeLoopbackState {
+    std::mutex mutex;
+    int opens{};
+    hal::LoopbackTarget last_target{};
+    double last_rate{};
+    std::uint32_t last_channels{};
+};
+FakeLoopbackState& fake_loopback() { static FakeLoopbackState value; return value; }
 
 struct FakeHal final : hal::Backend {
     hal::Snapshot snapshot() override {
@@ -135,6 +147,18 @@ struct FakeHal final : hal::Backend {
     std::unique_ptr<hal::InputStream> open_input(const hal::Device& device, hal::Capture capture) override {
         if (!device.input || FakeInput::refuse()) return nullptr;
         return std::make_unique<FakeInput>(std::move(capture));
+    }
+    std::unique_ptr<hal::InputStream> open_loopback(const hal::LoopbackTarget& target, double sample_rate,
+                                                    std::uint32_t channels, hal::Capture capture) override {
+        if (FakeInput::refuse()) return nullptr;
+        {
+            std::lock_guard lock(fake_loopback().mutex);
+            ++fake_loopback().opens;
+            fake_loopback().last_target = target;
+            fake_loopback().last_rate = sample_rate;
+            fake_loopback().last_channels = channels;
+        }
+        return std::make_unique<FakeInput>(std::move(capture), std::max(channels, 1U), 0.5f);
     }
 };
 
@@ -558,6 +582,170 @@ void ioproc_input(Fixture& f) {
     require(seen.buffers == 1 && seen.bytes == 512 * 4 && seen.outputs == 0 && seen.level == 0.25f, "one 512-frame float input buffer, no output");
     require(f.status(ca, "_AudioDeviceStop", {microphone, f.engine.read64(id)}) == 0 && FakeInput::live() == 0, "stopped; the microphone closed");
     require(f.status(ca, "_AudioDeviceDestroyIOProcID", {microphone, f.engine.read64(id)}) == 0, "destroyed");
+}
+
+// CoreAudio process taps over the fake HAL's loopback seam: HAL process objects,
+// CATapDescription -> AudioHardwareCreateProcessTap -> tap-only private aggregate device
+// -> IOProc receiving loopback audio, plus explicit refusal of muting taps and real aggregates.
+void process_tap(Fixture& f) {
+    const auto addr = f.block(12), size = f.block(4), val = f.block(64), qual = f.block(8);
+    const auto write_addr = [&](std::uint32_t sel, std::uint32_t scope = four("glob")) {
+        f.engine.write32(addr, sel);
+        f.engine.write32(addr + 4, scope);
+        f.engine.write32(addr + 8, 0);
+    };
+
+    // Process object list and PID translation for this process.
+    write_addr(four("prs#"));
+    require(f.status(ca, "_AudioObjectGetPropertyDataSize", {1, addr, 0, 0, size}) == 0 && f.engine.read32(size) >= 4, "process list size");
+    f.engine.write32(size, 64);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {1, addr, 0, 0, size, val}) == 0 && f.engine.read32(size) >= 4, "process list");
+    const auto self_proc = f.engine.read32(val);
+    write_addr(four("ppid"));
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {self_proc, addr, 0, 0, size, val}) == 0, "self process pid");
+    const auto self_pid = f.engine.read32(val);
+    require(self_pid != 0, "nonzero guest pid");
+    write_addr(four("id2p"));
+    f.engine.write32(qual, self_pid);
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {1, addr, 4, qual, size, val}) == 0 && f.engine.read32(val) == self_proc,
+            "TranslatePIDToProcessObject finds self");
+
+    // Refusals: muted taps (CATapMutedWhenTapped = 1, CATapMuted = 2) and non-tap aggregate devices.
+    const auto tap_cls = f.cls("CATapDescription");
+    const auto self_list = f.cf.array(std::vector<Address>{f.cf.integer(self_proc, 3)});
+    const auto muted = f.send(f.send(tap_cls, "alloc"), "initStereoMixdownOfProcesses:", {self_list});
+    f.send(muted, "setMuteBehavior:", {1});
+    const auto tap_out = f.block(4), agg_out = f.block(4);
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareCreateProcessTap", {muted, tap_out})) == four("unop") &&
+                f.engine.read32(tap_out) == 0,
+            "CATapMutedWhenTapped refused explicitly");
+    f.send(muted, "setMuteBehavior:", {2});
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareCreateProcessTap", {muted, tap_out})) == four("unop"),
+            "CATapMuted refused explicitly");
+    const auto dev_tap = f.send(f.send(tap_cls, "alloc"), "initWithProcesses:andDeviceUID:withStream:", {self_list, f.cf.string("{render}"), 0});
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareCreateProcessTap", {dev_tap, tap_out})) == four("unop"),
+            "device stream tap refused explicitly");
+    const auto plain_agg = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("name"), f.cf.string("Plain Aggregate")}, {f.cf.string("uid"), f.cf.string("plain-agg")}});
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareCreateAggregateDevice", {plain_agg, agg_out})) == four("unop") &&
+                f.engine.read32(agg_out) == 0,
+            "non-tap aggregate refused explicitly");
+
+    // Stereo inclusive process tap on this process, then private tap aggregate + IOProc.
+    const auto desc = f.send(f.send(tap_cls, "alloc"), "initStereoMixdownOfProcesses:", {self_list});
+    require(f.status(ca, "_AudioHardwareCreateProcessTap", {desc, tap_out}) == 0, "create stereo process tap");
+    const auto tap_id = f.engine.read32(tap_out);
+    require(tap_id != 0, "valid tap ID");
+    write_addr(four("tuid"));
+    f.engine.write32(size, 8);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {tap_id, addr, 0, 0, size, val}) == 0, "kAudioTapPropertyUID");
+    const auto tap_uid_cf = f.engine.read64(val);
+    const auto tap_uid = f.cf.utf8(tap_uid_cf);
+    require(!tap_uid.empty(), "tap UID non-empty");
+    write_addr(four("uidt"));
+    f.engine.write64(qual, tap_uid_cf);
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {1, addr, 8, qual, size, val}) == 0 && f.engine.read32(val) == tap_id,
+            "TranslateUIDToTap finds tap");
+    write_addr(four("tdsc"));
+    f.engine.write32(size, 8);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {tap_id, addr, 0, 0, size, val}) == 0 && f.engine.read64(val) == desc,
+            "kAudioTapPropertyDescription returns retained description");
+    f.send(f.engine.read64(val), "release");
+    write_addr(four("tfmt"));
+    f.engine.write32(size, 40);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {tap_id, addr, 0, 0, size, val}) == 0 &&
+                std::bit_cast<double>(f.engine.read64(val)) == 48000.0 && f.engine.read32(val + 28) == 2,
+            "kAudioTapPropertyFormat: stereo 48 kHz float");
+
+    // Private tap-only aggregate device.
+    const auto sub_tap = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("uid"), tap_uid_cf}, {f.cf.string("drift"), f.cf.boolean(true)}});
+    const auto agg_desc = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("name"), f.cf.string("Test Tap Aggregate")},
+        {f.cf.string("uid"), f.cf.string("alchemy.test.tap.agg")},
+        {f.cf.string("private"), f.cf.boolean(true)},
+        {f.cf.string("tapautostart"), f.cf.boolean(true)},
+        {f.cf.string("taps"), f.cf.array(std::vector<Address>{sub_tap})}});
+    require(f.status(ca, "_AudioHardwareCreateAggregateDevice", {agg_desc, agg_out}) == 0, "create tap aggregate");
+    const auto agg_id = f.engine.read32(agg_out);
+    require(agg_id != 0, "valid aggregate ID");
+    write_addr(four("clas"));
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {agg_id, addr, 0, 0, size, val}) == 0 && f.engine.read32(val) == four("aagg"),
+            "aggregate class 'aagg'");
+    write_addr(four("tran"));
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {agg_id, addr, 0, 0, size, val}) == 0 && f.engine.read32(val) == four("grup"),
+            "aggregate transport 'grup'");
+    // No host loopback opened before AudioDeviceStart.
+    {
+        std::lock_guard lock(fake_loopback().mutex);
+        require(fake_loopback().opens == 0, "loopback not opened until AudioDeviceStart");
+    }
+
+    auto& seen = input_seen();
+    seen.calls = 0;
+    seen.buffers = 0;
+    seen.bytes = 0;
+    seen.level = 0;
+    const auto proc = f.process.install_function("_alchemy_test_tap_ioproc", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        auto& seen = input_seen();
+        seen.buffers = m.read32(s.x[2]);
+        seen.bytes = m.read32(s.x[2] + 12);
+        seen.level = std::bit_cast<float>(m.read32(m.read64(s.x[2] + 16)));
+        seen.outputs = m.read32(s.x[4]);
+        ++seen.calls;
+        s.x[0] = 0;
+    }, std::string(ca));
+    const auto io_proc_id = f.block(8);
+    require(f.status(ca, "_AudioDeviceCreateIOProcID", {agg_id, proc, 0, io_proc_id}) == 0, "IOProc on tap aggregate");
+    require(f.status(ca, "_AudioDeviceStart", {agg_id, f.engine.read64(io_proc_id)}) == 0 && FakeInput::live() == 1, "start tap aggregate");
+    require(wait_for([&] { return seen.calls >= 3; }), "tap IOProc receives loopback buffers");
+    require(seen.buffers == 1 && seen.bytes == 512 * 2 * 4 && seen.outputs == 0 && seen.level == 0.5f,
+            "stereo 512-frame loopback buffer at 0.5");
+    {
+        std::lock_guard lock(fake_loopback().mutex);
+        require(fake_loopback().opens == 1 && fake_loopback().last_target.include && fake_loopback().last_target.process_id != 0 &&
+                    fake_loopback().last_channels == 2 && fake_loopback().last_rate == 48000.0,
+                "inclusive stereo loopback target");
+    }
+    require(f.status(ca, "_AudioDeviceStop", {agg_id, f.engine.read64(io_proc_id)}) == 0 && FakeInput::live() == 0, "stop tap aggregate");
+    require(f.status(ca, "_AudioDeviceDestroyIOProcID", {agg_id, f.engine.read64(io_proc_id)}) == 0, "destroy IOProc");
+    require(f.status(ca, "_AudioHardwareDestroyAggregateDevice", {agg_id}) == 0, "destroy aggregate");
+    require(f.status(ca, "_AudioHardwareDestroyProcessTap", {tap_id}) == 0, "destroy tap");
+
+    // Mono global exclusive tap (exclude empty list -> include=false, process_id=0, 1 channel).
+    const auto empty_list = f.cf.array({});
+    const auto mono_desc = f.send(f.send(tap_cls, "alloc"), "initMonoGlobalTapButExcludeProcesses:", {empty_list});
+    require(f.status(ca, "_AudioHardwareCreateProcessTap", {mono_desc, tap_out}) == 0, "create mono exclusive tap");
+    const auto mono_tap_id = f.engine.read32(tap_out);
+    write_addr(four("tuid"));
+    f.engine.write32(size, 8);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {mono_tap_id, addr, 0, 0, size, val}) == 0, "mono tap UID");
+    const auto mono_sub = f.cf.dictionary(std::vector<std::pair<Address, Address>>{{f.cf.string("uid"), f.engine.read64(val)}});
+    const auto mono_agg_desc = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("taps"), f.cf.array(std::vector<Address>{mono_sub})}, {f.cf.string("private"), f.cf.boolean(true)}});
+    require(f.status(ca, "_AudioHardwareCreateAggregateDevice", {mono_agg_desc, agg_out}) == 0, "create mono aggregate");
+    const auto mono_agg_id = f.engine.read32(agg_out);
+    seen.calls = 0;
+    seen.bytes = 0;
+    require(f.status(ca, "_AudioDeviceCreateIOProcID", {mono_agg_id, proc, 0, io_proc_id}) == 0, "IOProc on mono aggregate");
+    require(f.status(ca, "_AudioDeviceStart", {mono_agg_id, f.engine.read64(io_proc_id)}) == 0, "start mono aggregate");
+    require(wait_for([&] { return seen.calls >= 2; }), "mono tap IOProc runs");
+    require(seen.bytes == 512 * 4 && seen.level == 0.5f, "mono 512-frame loopback buffer");
+    {
+        std::lock_guard lock(fake_loopback().mutex);
+        require(fake_loopback().opens == 2 && !fake_loopback().last_target.include && fake_loopback().last_target.process_id == 0 &&
+                    fake_loopback().last_channels == 1,
+                "exclusive mono loopback target");
+    }
+    // Destroying an active aggregate cleanly stops its loopback stream and frees its IOProcs.
+    require(f.status(ca, "_AudioHardwareDestroyAggregateDevice", {mono_agg_id}) == 0 && FakeInput::live() == 0,
+            "destroy running aggregate stops loopback");
+    require(f.status(ca, "_AudioHardwareDestroyProcessTap", {mono_tap_id}) == 0, "destroy mono tap");
 }
 
 // AVAudioRecorder: 0.5 s of the fake microphone (mono 0.25 at 48 kHz) into a 16-bit stereo 16 kHz WAVE file,
@@ -1323,6 +1511,7 @@ int main() {
         {"auhal_input", auhal_input},
         {"audio_queue_input", audio_queue_input},
         {"ioproc_input", ioproc_input},
+        {"process_tap", process_tap},
         {"recorder", recorder},
         {"asset_writer", asset_writer},
         {"asset_writer_movie", asset_writer_movie},

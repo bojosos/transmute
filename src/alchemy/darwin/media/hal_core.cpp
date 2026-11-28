@@ -54,16 +54,24 @@ std::vector<std::uint8_t> float_format(double sample_rate, std::uint32_t channel
     return out;
 }
 
-Model::Model(Snapshot snapshot) : snapshot_(std::move(snapshot)) {
+Model::Model(Snapshot snapshot, std::vector<ProcessInfo> initial_processes, ProcessLookup process_lookup)
+    : snapshot_(std::move(snapshot)), process_lookup_(std::move(process_lookup)) {
+    next_id_ = first_device;
     for (std::size_t i = 0; i < snapshot_.devices.size(); ++i) {
         Entry entry;
-        entry.id = first_device + static_cast<std::uint32_t>(i) * stride;
-        entry.stream = entry.id + 1;
+        entry.id = next_id_;
+        entry.stream = next_id_ + 1;
+        next_id_ += stride;
         entry.device = snapshot_.devices[i];
         if (entry.device.channels == 0) entry.device.channels = 2;
         if (!(entry.device.sample_rate > 0)) entry.device.sample_rate = 48000;
         entries_.push_back(entry);
-        device_ids_.push_back(entry.id);
+        if (!entry.device.is_private) device_ids_.push_back(entry.id);
+    }
+    for (auto& info : initial_processes) {
+        if (!info.guest_pid) continue;
+        processes_.push_back({next_id_, std::move(info)});
+        next_id_ += stride;
     }
 }
 
@@ -75,11 +83,21 @@ const Model::Entry* Model::entry_for_stream(std::uint32_t object) const {
     for (const auto& entry : entries_) if (entry.stream == object) return &entry;
     return nullptr;
 }
+const Model::ProcessEntry* Model::entry_for_process(std::uint32_t object) const {
+    for (const auto& entry : processes_) if (entry.id == object) return &entry;
+    return nullptr;
+}
+const Model::TapEntry* Model::entry_for_tap(std::uint32_t object) const {
+    for (const auto& entry : taps_) if (entry.id == object) return &entry;
+    return nullptr;
+}
 
 std::optional<Kind> Model::kind(std::uint32_t object) const {
     if (object == system_object) return Kind::system;
     if (entry_for_device(object)) return Kind::device;
     if (entry_for_stream(object)) return Kind::stream;
+    if (entry_for_process(object)) return Kind::process;
+    if (entry_for_tap(object)) return Kind::tap;
     return std::nullopt;
 }
 
@@ -93,17 +111,127 @@ const Device* Model::device(std::uint32_t object) const {
     return entry ? &entry->device : nullptr;
 }
 
-std::int32_t Model::system_get(const Address& address, const std::optional<std::string>& qualifier, Value& out) const {
+std::uint32_t Model::translate_pid(std::uint32_t guest_pid) {
+    if (!guest_pid) return 0;
+    for (const auto& entry : processes_)
+        if (entry.info.guest_pid == guest_pid) return entry.id;
+    if (!process_lookup_) return 0;
+    auto found = process_lookup_(guest_pid);
+    if (!found) return 0;
+    if (!found->guest_pid) found->guest_pid = guest_pid;
+    const auto id = next_id_;
+    next_id_ += stride;
+    processes_.push_back({id, std::move(*found)});
+    return id;
+}
+
+const ProcessInfo* Model::process(std::uint32_t object) const {
+    const auto* entry = entry_for_process(object);
+    return entry ? &entry->info : nullptr;
+}
+
+std::uint32_t Model::add_tap(TapSpec spec) {
+    if (spec.channels == 0) spec.channels = 2;
+    if (!(spec.sample_rate > 0)) spec.sample_rate = 48000;
+    const auto id = next_id_;
+    next_id_ += stride;
+    taps_.push_back({id, std::move(spec)});
+    return id;
+}
+
+std::optional<TapSpec> Model::tap(std::uint32_t object) const {
+    const auto* entry = entry_for_tap(object);
+    return entry ? std::optional<TapSpec>(entry->spec) : std::nullopt;
+}
+
+std::optional<TapSpec> Model::tap_for_uid(const std::string& uid) const {
+    for (const auto& entry : taps_)
+        if (entry.spec.uid == uid) return entry.spec;
+    return std::nullopt;
+}
+
+std::optional<std::uint64_t> Model::remove_tap(std::uint32_t object) {
+    const auto it = std::find_if(taps_.begin(), taps_.end(), [&](const TapEntry& e) { return e.id == object; });
+    if (it == taps_.end()) return std::nullopt;
+    const auto desc = it->spec.description;
+    taps_.erase(it);
+    return desc;
+}
+
+std::vector<std::uint64_t> Model::tap_descriptions() const {
+    std::vector<std::uint64_t> out;
+    for (const auto& entry : taps_)
+        if (entry.spec.description) out.push_back(entry.spec.description);
+    return out;
+}
+
+std::uint32_t Model::add_aggregate_device(Device device) {
+    Entry entry;
+    entry.id = next_id_;
+    entry.stream = next_id_ + 1;
+    next_id_ += stride;
+    entry.device = std::move(device);
+    entry.device.aggregate = true;
+    entry.device.input = true;
+    if (entry.device.channels == 0) entry.device.channels = 2;
+    if (!(entry.device.sample_rate > 0)) entry.device.sample_rate = 48000;
+    entries_.push_back(entry);
+    if (!entry.device.is_private) device_ids_.push_back(entry.id);
+    return entry.id;
+}
+
+bool Model::remove_aggregate_device(std::uint32_t object) {
+    const auto it = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.id == object && e.device.aggregate; });
+    if (it == entries_.end()) return false;
+    entries_.erase(it);
+    std::erase(device_ids_, object);
+    return true;
+}
+
+std::int32_t Model::system_get(const Address& address, const Qualifier& qualifier, Value& out) const {
     const auto default_of = [this](const std::string& uid) { return uid.empty() ? 0U : device_for_uid(uid).value_or(0U); };
     switch (address.selector) {
     case four("dev#"): case four("ownd"): out = array32(device_ids_); return 0;
     case four("dIn "): out = u32(default_of(snapshot_.default_input)); return 0;
     case four("dOut"): case four("sOut"): out = u32(default_of(snapshot_.default_output)); return 0;
     case four("uidd"):   // kAudioHardwarePropertyTranslateUIDToDevice: qualifier = CFStringRef UID
-        if (!qualifier) return error::bad_size;
-        out = u32(device_for_uid(*qualifier).value_or(0U));
+        if (!qualifier.string) return error::bad_size;
+        out = u32(device_for_uid(*qualifier.string).value_or(0U));
         return 0;
-    case four("plg#"): case four("box#"): case four("clk#"): case four("tps#"): out = array32({}); return 0;
+    case four("prs#"): {   // kAudioHardwarePropertyProcessObjectList
+        std::vector<std::uint32_t> ids;
+        ids.reserve(processes_.size());
+        for (const auto& p : processes_) ids.push_back(p.id);
+        out = array32(ids);
+        return 0;
+    }
+    case four("id2p"): {   // kAudioHardwarePropertyTranslatePIDToProcessObject: qualifier = pid_t (4 bytes)
+        if (!qualifier.pid) return error::bad_size;
+        std::uint32_t found = 0;
+        if (*qualifier.pid > 0) {
+            const auto pid = static_cast<std::uint32_t>(*qualifier.pid);
+            for (const auto& p : processes_)
+                if (p.info.guest_pid == pid) { found = p.id; break; }
+        }
+        out = u32(found);
+        return 0;
+    }
+    case four("tps#"): {   // kAudioHardwarePropertyTapList (public taps)
+        std::vector<std::uint32_t> ids;
+        for (const auto& t : taps_)
+            if (!t.spec.is_private) ids.push_back(t.id);
+        out = array32(ids);
+        return 0;
+    }
+    case four("uidt"): {   // kAudioHardwarePropertyTranslateUIDToTap: qualifier = CFStringRef UID
+        if (!qualifier.string) return error::bad_size;
+        std::uint32_t found = 0;
+        for (const auto& t : taps_)
+            if (t.spec.uid == *qualifier.string) { found = t.id; break; }
+        out = u32(found);
+        return 0;
+    }
+    case four("plg#"): case four("box#"): case four("clk#"): out = array32({}); return 0;
     case four("clas"): out = u32(four("asys")); return 0;
     case four("bcls"): out = u32(four("aobj")); return 0;
     case four("stdv"): out = u32(0); return 0;
@@ -119,8 +247,8 @@ std::int32_t Model::device_get(const Entry& entry, const Address& address, Value
     const auto direction = d.input ? scope_input : scope_output;
     const bool in_scope = address.scope == direction || address.scope == scope_global;
     switch (address.selector) {
-    case four("clas"): out = u32(four("adev")); return 0;
-    case four("bcls"): out = u32(four("aobj")); return 0;
+    case four("clas"): out = u32(d.aggregate ? four("aagg") : four("adev")); return 0;
+    case four("bcls"): out = u32(d.aggregate ? four("adev") : four("aobj")); return 0;
     case four("stdv"): out = u32(system_object); return 0;
     case four("lnam"): out = text(d.name); return 0;
     case four("lmak"):
@@ -137,10 +265,10 @@ std::int32_t Model::device_get(const Entry& entry, const Address& address, Value
         out = v;
         return 0;
     }
-    case four("tran"): out = u32(d.form_factor == 9 ? four("hdmi") : 0U); return 0;   // DigitalAudioDisplayDevice
+    case four("tran"): out = u32(d.aggregate ? four("grup") : d.form_factor == 9 ? four("hdmi") : 0U); return 0;
     case four("livn"): out = u32(1); return 0;
     case four("goin"): case four("gone"): out = u32(0); return 0;   // no I/O runs
-    case four("hidn"): out = u32(0); return 0;
+    case four("hidn"): out = u32(d.is_private ? 1 : 0); return 0;
     case four("dflt"): out = u32(address.scope == direction ? 1 : 0); return 0;
     case four("sflt"): out = u32(!d.input && address.scope == scope_output ? 1 : 0); return 0;
     case four("nsrt"): { Value v; put_real(v.bytes, d.sample_rate); out = v; return 0; }
@@ -229,24 +357,63 @@ std::int32_t Model::stream_get(const Entry& entry, const Address& address, Value
     }
 }
 
+std::int32_t Model::process_get(const ProcessEntry& entry, const Address& address, Value& out) const {
+    // kAudioProcessClassID ('clnt') and kAudioProcessProperty* selectors.
+    switch (address.selector) {
+    case four("clas"): out = u32(four("clnt")); return 0;
+    case four("bcls"): out = u32(four("aobj")); return 0;
+    case four("stdv"): out = u32(system_object); return 0;
+    case four("ppid"): out = u32(entry.info.guest_pid); return 0;    // kAudioProcessPropertyPID
+    case four("pbid"): out = text(entry.info.bundle_id); return 0;   // kAudioProcessPropertyBundleID
+    case four("pdv#"): out = array32({}); return 0;                  // kAudioProcessPropertyDevices
+    case four("pir?"): case four("piri"): case four("piro"): out = u32(0); return 0;
+    default: return error::unknown_property;
+    }
+}
+
+std::int32_t Model::tap_get(const TapEntry& entry, const Address& address, Value& out) const {
+    // kAudioTapClassID ('tapy') and kAudioTapProperty* selectors.
+    switch (address.selector) {
+    case four("clas"): out = u32(four("tapy")); return 0;
+    case four("bcls"): out = u32(four("aobj")); return 0;
+    case four("stdv"): out = u32(system_object); return 0;
+    case four("tuid"): out = text(entry.spec.uid); return 0;         // kAudioTapPropertyUID
+    case four("tdsc"): {                                             // kAudioTapPropertyDescription
+        Value v;
+        v.object = entry.spec.description;
+        out = v;
+        return 0;
+    }
+    case four("tfmt"): {                                             // kAudioTapPropertyFormat
+        Value v;
+        v.bytes = float_format(entry.spec.sample_rate, entry.spec.channels);
+        out = v;
+        return 0;
+    }
+    default: return error::unknown_property;
+    }
+}
+
 bool Model::has(std::uint32_t object, const Address& address) const {
     Value ignored;
-    return get(object, address, std::string(), ignored) == 0;
+    return get(object, address, Qualifier{std::string(), 0}, ignored) == 0;
 }
 
 std::int32_t Model::settable(std::uint32_t object, const Address& address, bool& out) const {
     Value ignored;
-    if (const auto result = get(object, address, std::string(), ignored)) return result;
+    if (const auto result = get(object, address, Qualifier{std::string(), 0}, ignored)) return result;
     const auto kind = this->kind(object);
     const auto s = address.selector;
     out = (kind == Kind::system && (s == four("rnlp") || s == four("slep"))) || (kind == Kind::device && s == four("fsiz"));
     return 0;
 }
 
-std::int32_t Model::get(std::uint32_t object, const Address& address, const std::optional<std::string>& qualifier, Value& out) const {
+std::int32_t Model::get(std::uint32_t object, const Address& address, const Qualifier& qualifier, Value& out) const {
     if (object == system_object) return system_get(address, qualifier, out);
     if (const auto* entry = entry_for_device(object)) return device_get(*entry, address, out);
     if (const auto* entry = entry_for_stream(object)) return stream_get(*entry, address, out);
+    if (const auto* entry = entry_for_process(object)) return process_get(*entry, address, out);
+    if (const auto* entry = entry_for_tap(object)) return tap_get(*entry, address, out);
     return error::bad_object;
 }
 

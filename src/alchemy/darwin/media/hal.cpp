@@ -4,6 +4,8 @@
 #include "alchemy/darwin/media/hal_io.hpp"
 
 #include "alchemy/engine_adapter.hpp"
+#include "alchemy/host/process.hpp"
+#include "alchemy/process_tree.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -73,22 +75,48 @@ struct Hal {
 
     explicit Hal(Support& owner) : support(owner) {}
 
-    // The device list, read on first use.
+    // The device list and initial process object (this process), read on first use.
     hal::Model& get() {
         if (!model) {
             if (hal_factory()) backend = hal_factory()();
             else if (const char* value = std::getenv("ALCHEMY_AUDIO_DEVICES"); value && std::string_view(value) == "none") backend = std::make_unique<NoDevices>();
             else backend = hal::make_host_backend();
-            model.emplace(backend->snapshot());
+            const auto self_record = alchemy::process_tree::self();
+            const auto host_pid = alchemy::host::process::current_pid();
+            hal::ProcessInfo self_info;
+            self_info.guest_pid = self_record && self_record->pid ? self_record->pid : host_pid;
+            self_info.host_pid = self_record && self_record->host_pid ? self_record->host_pid : host_pid;
+            if (const auto bundle_cls = support.objc.find_class("NSBundle")) {
+                if (const auto main_bundle = support.send_id(bundle_cls, "mainBundle")) {
+                    if (const auto identifier = support.send_id(main_bundle, "bundleIdentifier"))
+                        self_info.bundle_id = support.cf.utf8(identifier);
+                }
+            }
+            if (self_info.bundle_id.empty() && self_record) self_info.bundle_id = self_record->name;
+            auto lookup = [](std::uint32_t guest_pid) -> std::optional<hal::ProcessInfo> {
+                const auto record = alchemy::process_tree::lookup(guest_pid);
+                if (!record) return std::nullopt;
+                return hal::ProcessInfo{record->pid, record->host_pid ? record->host_pid : record->pid, record->name};
+            };
+            model.emplace(backend->snapshot(), std::vector<hal::ProcessInfo>{std::move(self_info)}, std::move(lookup));
         }
         return *model;
     }
     static hal::Address address(GuestMemory& m, Address at) { return {m.read32(at), m.read32(at + 4), m.read32(at + 8)}; }
-    // The qualifier of kAudioHardwarePropertyTranslateUIDToDevice: a CFStringRef.
-    std::optional<std::string> qualifier(GuestMemory& m, std::uint64_t size, Address at) {
-        if (size < 8 || !at) return std::nullopt;
-        const auto string = m.read64(at);
-        return string ? std::optional<std::string>(support.cf.utf8(string)) : std::nullopt;
+    // Qualifiers for TranslateUIDToDevice / TranslateUIDToTap (CFStringRef) and
+    // TranslatePIDToProcessObject (pid_t).
+    hal::Qualifier qualifier(GuestMemory& m, const hal::Address& address, std::uint32_t size, Address at) {
+        hal::Qualifier out;
+        if (address.selector == hal::four("id2p")) {
+            if (size >= 4 && at) out.pid = static_cast<std::int32_t>(m.read32(at));
+            return out;
+        }
+        if (address.selector == hal::four("uidd") || address.selector == hal::four("uidt")) {
+            if (size >= 8 && at) {
+                if (const auto string = m.read64(at)) out.string = support.cf.utf8(string);
+            }
+        }
+        return out;
     }
     // The input device's capture (nullptr for an output device). Under the mutex.
     std::shared_ptr<hal_io::InputIo> input_io(std::uint32_t id) {
@@ -145,14 +173,15 @@ void write_time_stamp(GuestMemory& m, Address at, double sample_time, std::uint6
 
 // AudioObjectGetPropertyData's work (also the older AudioHardware/AudioDevice/AudioStream calls): the
 // value into (UInt32 *ioSize, void *out). Arrays are truncated to the elements that fit; other values
-// need their whole size. CFStrings are +1.
+// need their whole size. CFStrings and ObjC objects are +1.
 std::int32_t get_property(Hal& state, GuestMemory& m, std::uint32_t object, const hal::Address& address,
-                          const std::optional<std::string>& qualifier, Address size_at, Address out) {
+                          const hal::Qualifier& qualifier, Address size_at, Address out) {
     hal::Value value;
     {
         std::lock_guard lock(state.mutex);
-        if (address.selector == hal::four("uidd") && !qualifier) return hal::error::bad_size;
-        if (const auto result = state.get().get(object, address, qualifier.value_or(std::string()), value)) {
+        if (object == hal::system_object && address.selector == hal::four("id2p") && qualifier.pid && *qualifier.pid > 0)
+            static_cast<void>(state.get().translate_pid(static_cast<std::uint32_t>(*qualifier.pid)));
+        if (const auto result = state.get().get(object, address, qualifier, value)) {
             state.log_unknown(object, address, result);
             return result;
         }
@@ -161,6 +190,13 @@ std::int32_t get_property(Hal& state, GuestMemory& m, std::uint32_t object, cons
     if (value.string) {
         if (room < 8 || !out) return hal::error::bad_size;
         m.write64(out, state.support.cf.string(*value.string));
+        m.write32(size_at, 8);
+        return 0;
+    }
+    if (value.object) {
+        if (room < 8 || !out) return hal::error::bad_size;
+        const auto retained = *value.object ? state.support.send_id(*value.object, "retain") : 0;
+        m.write64(out, retained);
         m.write32(size_at, 8);
         return 0;
     }
@@ -311,7 +347,7 @@ std::vector<HalInputDevice> hal_input_devices() {
     if (!state) return out;
     std::lock_guard lock(state->mutex);
     for (const auto id : state->get().devices())
-        if (const auto* device = state->get().device(id); device && device->input)
+        if (const auto* device = state->get().device(id); device && device->input && !device->aggregate)
             out.push_back({id, device->uid, device->name, std::max(device->channels, 1U), device->sample_rate > 0 ? device->sample_rate : 48000.0});
     return out;
 }
@@ -322,6 +358,7 @@ std::unique_ptr<hal::InputStream> hal_open_input(std::uint32_t id, std::function
     std::lock_guard lock(state->mutex);
     const auto* device = state->get().device(id);
     if (!device || !device->input || !state->backend) return nullptr;
+    if (device->loopback) return state->backend->open_loopback(*device->loopback, device->sample_rate, device->channels, std::move(capture));
     return state->backend->open_input(*device, std::move(capture));
 }
 
@@ -364,19 +401,26 @@ void install_hal(Support& support) {
     // (object, address, UInt32 qualifierSize, const void *qualifier, UInt32 *outDataSize)
     support.function(core_audio, "_AudioObjectGetPropertyDataSize", [state](CpuState& s, GuestMemory& m) {
         if (!s.x[1] || !s.x[4]) return status(s, hal::error::param);
+        const auto object = static_cast<std::uint32_t>(s.x[0]);
+        const auto address = Hal::address(m, s.x[1]);
+        auto qualifier = state->qualifier(m, address, static_cast<std::uint32_t>(s.x[2]), s.x[3]);
+        if ((address.selector == hal::four("uidd") || address.selector == hal::four("uidt")) && !qualifier.string)
+            qualifier.string = std::string();
+        if (address.selector == hal::four("id2p") && !qualifier.pid) qualifier.pid = 0;
         std::lock_guard lock(state->mutex);
+        if (object == hal::system_object && address.selector == hal::four("id2p") && qualifier.pid && *qualifier.pid > 0)
+            static_cast<void>(state->get().translate_pid(static_cast<std::uint32_t>(*qualifier.pid)));
         hal::Value value;
-        const auto result = state->get().get(static_cast<std::uint32_t>(s.x[0]), Hal::address(m, s.x[1]),
-                                             state->qualifier(m, static_cast<std::uint32_t>(s.x[2]), s.x[3]).value_or(std::string()), value);
-        state->log_unknown(static_cast<std::uint32_t>(s.x[0]), Hal::address(m, s.x[1]), result);
-        if (!result) m.write32(s.x[4], value.string ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
+        const auto result = state->get().get(object, address, qualifier, value);
+        state->log_unknown(object, address, result);
+        if (!result) m.write32(s.x[4], (value.string || value.object) ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
         status(s, result);
     });
     // (object, address, qualifierSize, qualifier, UInt32 *ioDataSize, void *outData)
     support.function(core_audio, "_AudioObjectGetPropertyData", [state](CpuState& s, GuestMemory& m) {
         if (!s.x[1] || !s.x[4]) return status(s, hal::error::param);
         const auto address = Hal::address(m, s.x[1]);
-        const auto qualifier = state->qualifier(m, static_cast<std::uint32_t>(s.x[2]), s.x[3]);
+        const auto qualifier = state->qualifier(m, address, static_cast<std::uint32_t>(s.x[2]), s.x[3]);
         status(s, get_property(*state, m, static_cast<std::uint32_t>(s.x[0]), address, qualifier, s.x[4], s.x[5]));
     });
     // (object, address, qualifierSize, qualifier, UInt32 dataSize, const void *data)
@@ -434,7 +478,7 @@ void install_hal(Support& support) {
         if (result) return status(s, result);
         bool settable{};
         if (state->get().settable(object, address, settable)) settable = false;
-        if (size_at) m.write32(size_at, value.string ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
+        if (size_at) m.write32(size_at, (value.string || value.object) ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
         if (writable_at) m.write8(writable_at, settable ? 1 : 0);
         status(s, 0);
     };
@@ -448,7 +492,7 @@ void install_hal(Support& support) {
     };
     const auto get = [state](CpuState& s, GuestMemory& m, std::uint32_t object, const hal::Address& address, Address size_at, Address out) {
         if (!size_at) return status(s, hal::error::param);
-        status(s, get_property(*state, m, object, address, std::nullopt, size_at, out));
+        status(s, get_property(*state, m, object, address, hal::Qualifier{}, size_at, out));
     };
     const auto object = [](std::uint64_t value) { return static_cast<std::uint32_t>(value); };
     // AudioHardwareGetPropertyInfo(id, outSize, outWritable), AudioHardwareGetProperty(id, ioSize, out),
@@ -681,6 +725,169 @@ void install_hal(Support& support) {
         else if (flags & 2) sample = std::max(sample, timing.now_sample + static_cast<double>(static_cast<std::int64_t>(m.read64(s.x[1] + 8) - timing.now_host)) * rate / 1e9);
         write_time_stamp(m, s.x[1], sample,
                          static_cast<std::uint64_t>(static_cast<std::int64_t>(timing.now_host) + std::llround((sample - timing.now_sample) / rate * 1e9)));
+        status(s, 0);
+    });
+
+    // ---- process taps and tap-only aggregate devices -----------------------------------------
+    // OSStatus AudioHardwareCreateProcessTap(CATapDescription *inDescription, AudioObjectID *outTapID)
+    support.function(core_audio, "_AudioHardwareCreateProcessTap", [state](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write32(s.x[1], 0);
+        if (!s.x[0] || !s.x[1]) return status(s, hal::error::param);
+        const auto description = s.x[0];
+        // Muting the tapped process (CATapMutedWhenTapped = 1, CATapMuted = 2) is unsupported:
+        // Windows process loopback cannot silence the source process.
+        if (static_cast<std::int64_t>(state->support.send_id(description, "muteBehavior")) != 0)
+            return status(s, hal::error::unsupported);
+        if (const auto device_uid = state->support.send_id(description, "deviceUID"); device_uid && !state->support.cf.utf8(device_uid).empty())
+            return status(s, hal::error::unsupported);
+        const bool is_mono = (state->support.send_id(description, "isMono") & 0xff) != 0;
+        const bool is_exclusive = (state->support.send_id(description, "isExclusive") & 0xff) != 0;
+        const bool is_private = (state->support.send_id(description, "isPrivate") & 0xff) != 0;
+        std::string uid;
+        if (const auto uuid = state->support.send_id(description, "UUID")) {
+            if (const auto uuid_str = state->support.send_id(uuid, "UUIDString"))
+                uid = state->support.cf.utf8(uuid_str);
+        }
+        if (uid.empty()) return status(s, hal::error::param);
+        std::vector<std::uint32_t> process_objects;
+        if (const auto array = state->support.send_id(description, "processes")) {
+            for (const auto item : state->support.cf.array_values(array)) {
+                const auto num = state->support.cf.number_value(item);
+                if (!num || *num <= 0) return status(s, hal::error::param);
+                process_objects.push_back(static_cast<std::uint32_t>(*num));
+            }
+        }
+        if (process_objects.size() > 1) return status(s, hal::error::unsupported);
+        if (!is_exclusive && process_objects.empty()) return status(s, hal::error::param);
+        hal::LoopbackTarget target{};
+        target.include = !is_exclusive;
+        {
+            std::lock_guard lock(state->mutex);
+            if (!process_objects.empty()) {
+                const auto* proc = state->get().process(process_objects.front());
+                if (!proc) return status(s, hal::error::bad_object);
+                target.process_id = proc->host_pid;
+            }
+        }
+        const auto retained = state->support.send_id(description, "retain");
+        std::uint32_t tap_id{};
+        {
+            std::lock_guard lock(state->mutex);
+            tap_id = state->get().add_tap({std::move(uid), retained, is_mono ? 1U : 2U, 48000.0, target, is_private});
+        }
+        m.write32(s.x[1], tap_id);
+        status(s, 0);
+    });
+    // OSStatus AudioHardwareDestroyProcessTap(AudioObjectID inTap)
+    support.function(core_audio, "_AudioHardwareDestroyProcessTap", [state](CpuState& s, GuestMemory&) {
+        std::optional<Address> description;
+        {
+            std::lock_guard lock(state->mutex);
+            description = state->get().remove_tap(static_cast<std::uint32_t>(s.x[0]));
+        }
+        if (!description) return status(s, hal::error::bad_object);
+        if (*description) static_cast<void>(state->support.send_id(*description, "release"));
+        status(s, 0);
+    });
+    // OSStatus AudioHardwareCreateAggregateDevice(CFDictionaryRef inDescription, AudioObjectID *outDeviceID)
+    support.function(core_audio, "_AudioHardwareCreateAggregateDevice", [state](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write32(s.x[1], 0);
+        if (!s.x[0] || !s.x[1]) return status(s, hal::error::param);
+        if (state->support.cf.kind(s.x[0]) != ObjectKind::dictionary) return status(s, hal::error::param);
+        const auto bool_of = [&](Address value) -> bool {
+            if (!value) return false;
+            if (value == state->support.cf.boolean(true)) return true;
+            if (value == state->support.cf.boolean(false)) return false;
+            const auto num = state->support.cf.number_value(value);
+            return num && *num != 0.0;
+        };
+        std::string name, uid;
+        bool is_private = false;
+        std::vector<std::string> tap_uids;
+        bool has_taps = false;
+        for (const auto& [k, v] : state->support.cf.dictionary_entries(s.x[0])) {
+            if (state->support.cf.kind(k) != ObjectKind::string) continue;
+            const auto key = state->support.cf.utf8(k);
+            if (key == "name" && v && state->support.cf.kind(v) == ObjectKind::string) name = state->support.cf.utf8(v);
+            else if (key == "uid" && v && state->support.cf.kind(v) == ObjectKind::string) uid = state->support.cf.utf8(v);
+            else if (key == "private") is_private = bool_of(v);
+            else if (key == "taps") {
+                if (!v || state->support.cf.kind(v) != ObjectKind::array) return status(s, hal::error::param);
+                has_taps = true;
+                for (const auto item : state->support.cf.array_values(v)) {
+                    if (!item || state->support.cf.kind(item) != ObjectKind::dictionary) return status(s, hal::error::param);
+                    std::string sub_uid;
+                    for (const auto& [tk, tv] : state->support.cf.dictionary_entries(item)) {
+                        if (state->support.cf.kind(tk) == ObjectKind::string && state->support.cf.utf8(tk) == "uid" &&
+                            tv && state->support.cf.kind(tv) == ObjectKind::string)
+                            sub_uid = state->support.cf.utf8(tv);
+                    }
+                    if (sub_uid.empty()) return status(s, hal::error::param);
+                    tap_uids.push_back(std::move(sub_uid));
+                }
+            }
+        }
+        // Only single-tap aggregate devices are supported; real sub-device aggregates stay unsupported.
+        if (!has_taps || tap_uids.empty() || tap_uids.size() > 1) return status(s, hal::error::unsupported);
+        std::uint32_t device_id{};
+        {
+            std::lock_guard lock(state->mutex);
+            const auto tap = state->get().tap_for_uid(tap_uids.front());
+            if (!tap) return status(s, hal::error::bad_object);
+            if (uid.empty()) {
+                uid = tap->uid + ".aggregate";
+                for (std::uint32_t suffix = 2; state->get().device_for_uid(uid); ++suffix)
+                    uid = tap->uid + ".aggregate." + std::to_string(suffix);
+            } else if (state->get().device_for_uid(uid)) {
+                return status(s, hal::error::illegal_operation);
+            }
+            if (name.empty()) name = "Tap Aggregate Device";
+            hal::Device device;
+            device.uid = std::move(uid);
+            device.name = std::move(name);
+            device.input = true;
+            device.channels = tap->channels;
+            device.sample_rate = tap->sample_rate;
+            device.channel_mask = tap->channels == 1 ? 0x4U : 0x3U;
+            device.aggregate = true;
+            device.is_private = is_private;
+            device.loopback = tap->target;
+            device.tap_uids = std::move(tap_uids);
+            device_id = state->get().add_aggregate_device(std::move(device));
+        }
+        m.write32(s.x[1], device_id);
+        status(s, 0);
+    });
+    // OSStatus AudioHardwareDestroyAggregateDevice(AudioObjectID inDeviceID)
+    support.function(core_audio, "_AudioHardwareDestroyAggregateDevice", [state](CpuState& s, GuestMemory&) {
+        const auto device = static_cast<std::uint32_t>(s.x[0]);
+        std::shared_ptr<hal_io::InputIo> input;
+        std::vector<std::pair<Address, std::shared_ptr<IoProc>>> removed_procs;
+        {
+            std::lock_guard lock(state->mutex);
+            if (!state->get().remove_aggregate_device(device)) return status(s, hal::error::bad_device);
+            if (const auto slot = state->inputs.find(device); slot != state->inputs.end()) {
+                input = std::move(slot->second);
+                state->inputs.erase(slot);
+            }
+            for (auto it = state->procs.begin(); it != state->procs.end();) {
+                if (it->second->device == device) {
+                    removed_procs.emplace_back(it->first, std::move(it->second));
+                    it = state->procs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (input) {
+            for (const auto& [proc_id, _] : removed_procs) input->stop(proc_id);
+            input->stop(0);
+            input.reset();
+        }
+        for (const auto& [_, proc] : removed_procs) {
+            if (proc->block) static_cast<void>(state->support.call(libsystem, "__Block_release", {proc->block}));
+            if (proc->memory) state->support.process.release_guest(proc->memory);
+        }
         status(s, 0);
     });
 

@@ -230,6 +230,23 @@ public:
         }
         return std::make_unique<HostInput>(*opened);
     }
+
+    std::unique_ptr<InputStream> open_loopback(const LoopbackTarget& target, double sample_rate, std::uint32_t channels, Capture capture) override {
+        const auto rate = sample_rate > 0 ? sample_rate : 48000.0;
+        const auto ch = channels ? channels : 2U;
+        Device virtual_device;
+        virtual_device.input = true;
+        virtual_device.channels = ch;
+        virtual_device.sample_rate = rate;
+        if (input_mode() == InputMode::tone) return std::make_unique<SilentInput>(virtual_device, std::move(capture), true);
+        if (input_mode() == InputMode::silent) return std::make_unique<SilentInput>(virtual_device, std::move(capture));
+        auto opened = host::audio::open_loopback({target.process_id, target.include}, static_cast<std::uint32_t>(rate), ch, std::move(capture));
+        if (!opened) {
+            std::cerr << "alchemy: process audio loopback did not open (" << host::name(opened.error()) << ")" << std::endl;
+            return nullptr;
+        }
+        return std::make_unique<HostInput>(*opened);
+    }
 };
 
 } // namespace
