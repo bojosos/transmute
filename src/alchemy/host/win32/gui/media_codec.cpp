@@ -32,6 +32,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #pragma comment(lib, "ole32.lib")
@@ -418,6 +419,8 @@ public:
     VideoSettings settings;
     std::vector<std::vector<std::uint8_t>> parameter_sets;
     std::vector<Sample> ready;
+    std::optional<std::int64_t> first_pts;
+    std::optional<std::int64_t> time_shift;
 
     // Splits an output sample: parameter sets aside, delimiters dropped, the rest length-prefixed.
     void take(IMFSample* out) {
@@ -448,7 +451,16 @@ public:
             else parameter_sets.push_back(std::move(set));
         }
         std::stable_sort(parameter_sets.begin(), parameter_sets.end(), [&](const auto& a, const auto& b) { return key(a) < key(b); });
-        if (!s.data.empty()) ready.push_back(std::move(s));
+        if (!s.data.empty()) {
+            // Some encoders (Microsoft's software H.264 encoder with B-frames) shift output times forward by their
+            // reordering delay so decode times stay non-negative; return samples in the input's time base.
+            if (!time_shift && first_pts) time_shift = s.pts - *first_pts;
+            if (time_shift) {
+                s.pts -= *time_shift;
+                s.dts -= *time_shift;
+            }
+            ready.push_back(std::move(s));
+        }
     }
 };
 
@@ -622,6 +634,7 @@ Status encode(VideoEncoder* encoder, const Picture& picture, bool keyframe, std:
             set_codec_value(encoder->driver.codec_api.p, CODECAPI_AVEncVideoForceKeyFrame, 1);
             sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
         }
+        if (!encoder->first_pts) encoder->first_pts = picture.pts;
         return encoder->driver.feed(sample.p, [encoder](IMFSample* s) { encoder->take(s); });
     });
     for (auto& s : encoder->ready) out.push_back(std::move(s));
@@ -632,7 +645,12 @@ Status encode(VideoEncoder* encoder, const Picture& picture, bool keyframe, std:
 
 Status drain(VideoEncoder* encoder, std::vector<Sample>& out) {
     if (!encoder) return Error::invalid_argument;
-    const auto error = encoder->worker.run([encoder]() -> Error { return encoder->driver.drain([encoder](IMFSample* s) { encoder->take(s); }); });
+    const auto error = encoder->worker.run([encoder]() -> Error {
+        const auto result = encoder->driver.drain([encoder](IMFSample* s) { encoder->take(s); });
+        encoder->first_pts.reset();
+        encoder->time_shift.reset();
+        return result;
+    });
     for (auto& s : encoder->ready) out.push_back(std::move(s));
     encoder->ready.clear();
     if (error != Error::none) return error;

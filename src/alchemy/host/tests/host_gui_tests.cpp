@@ -216,11 +216,18 @@ void media_codecs() {
             mc::close(*again);
         }
         // Reordered frames (B-frames where the encoder makes them): the decoder gives every picture back in presentation
-        // order, from the first one on.
+        // order, from the first one on. Test each distinct encoder that accepts the settings so hosts with a hardware
+        // encoder that makes no B-frames still exercise software encoders that do.
         if (!video_decoders->empty()) {
-            auto reordered = settings;
-            reordered.frame_reordering = true;
-            if (const auto again = mc::open_video(reordered)) {
+            std::vector<std::string> seen_ids;
+            for (const auto& candidate : *listed) {
+                if (std::find(seen_ids.begin(), seen_ids.end(), candidate.id) != seen_ids.end()) continue;
+                seen_ids.push_back(candidate.id);
+                auto reordered = settings;
+                reordered.frame_reordering = true;
+                reordered.component = candidate.id;
+                const auto again = mc::open_video(reordered);
+                if (!again) continue;
                 std::vector<mc::Sample> coded;
                 for (int i = 0; i < 20; ++i) {
                     mc::Picture p{320, 240, luma.data(), 320, chroma.data(), 320, i * 333333LL, 333333};
@@ -235,9 +242,9 @@ void media_codecs() {
                 for (const auto& sample : coded) require(static_cast<bool>(mc::decode(*decoder, sample, shown)), std::string(names(codec)) + ": decodes reordered");
                 require(static_cast<bool>(mc::drain(*decoder, shown)) && shown.size() == 20, std::string(names(codec)) + ": twenty pictures");
                 for (std::size_t i = 0; i < shown.size(); ++i)
-                    require(shown[i].pts == static_cast<std::int64_t>(i) * 333333, std::string(names(codec)) + ": reordered picture " + std::to_string(i) +
-                                                                                     " in presentation order (" + std::to_string(shown[i].pts) + ")");
-                std::cout << names(codec) << ": " << (out_of_order ? "B-frames" : "no reordering from this encoder") << ", decoded in presentation order" << '\n';
+                    require(shown[i].pts == static_cast<std::int64_t>(i) * 333333, std::string(names(codec)) + " (" + candidate.name + "): reordered picture " +
+                                                                                     std::to_string(i) + " in presentation order (" + std::to_string(shown[i].pts) + ")");
+                std::cout << names(codec) << " (" << candidate.name << "): " << (out_of_order ? "B-frames" : "no reordering from this encoder") << ", decoded in presentation order" << '\n';
                 mc::close(*decoder);
                 mc::close(*again);
             }
