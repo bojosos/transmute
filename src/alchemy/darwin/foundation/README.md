@@ -17,6 +17,8 @@
   NSProxy's own versions refuse (NSInvalidArgumentException).
   NSMetadataQuery with no Spotlight index (a started query gathers nothing)
   and NSHost through libSystem's resolver (metadata_and_hosts.cpp);
+  NSUnit, NSUnitConverter, NSUnitConverterLinear, NSDimension, NSMeasurement
+  and the 22 standard NSDimension subclasses (units.cpp);
   NSProtocolFromString / NSStringFromProtocol (foundation_bridge.cpp).
 - **Also here for now:** libobjc's associated objects (objc_assoc.cpp). They
   belong to the Objective-C runtime (src/alchemy/objc/), which stays put in
