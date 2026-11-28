@@ -212,8 +212,11 @@ bool known_constant(const Plan& plan, std::int32_t index, unsigned g, std::uint6
 }
 
 bool dead_after(const Plan& plan, std::int32_t index, unsigned g) {
-    const auto bit = 1u << g;
     const auto n = static_cast<std::int32_t>(plan.insts.size());
+    if (index < 0 || index >= n) return false;
+    const auto& pi = plan.insts[static_cast<std::size_t>(index)];
+    if ((pi.flow != Flow::normal && !pi.inline_call) || pi.fall != index + 1) return false;
+    const auto bit = 1u << g;
     for (std::int32_t j = index + 1; j < n && j <= index + kScanAhead; ++j) {
         const auto& pj = plan.insts[static_cast<std::size_t>(j)];
         if (pj.leader || pj.flow == Flow::interpret || pj.conservative_writes) return false;
@@ -1760,40 +1763,69 @@ std::int32_t RegionEmitter::ccmp_bool_reader() const {
 }
 
 // Branchless dead-CSET byte-OR/AND fusion:
-//   CSET w1, c1 ; CMP a, b ; CSET w2, c2 ; ORR/AND w3, w1, w2 ; CBZ/CBNZ/TBZ#0/TBNZ#0 w3
-// When w1, w2, w3 are unpinned and observably dead after the branch and NZCV is
-// dead after CSET2, skips both 32-bit zero-extensions (`mov r32, 0`), evaluates
-// `setcc t1b; cmp; setcc t2b; or/test t1b, t2b` in two scratch bytes, and feeds
-// the adjacent branch via cset_inst_ (consumed = 4).
+//   CSET w1, c1 ; [LDR wT, =lit ;] CMP a, b ; CSET w2, c2 ; ORR/AND w3, w1, w2 ; CBZ/CBNZ/TBZ#0/TBNZ#0 w3
+// When w1, w2, w3 (and optional same-page wT) are observably dead after the
+// branch (or dead on fallthrough with uniquely known architectural values on a
+// cold taken/deopt edge) and NZCV is dead after CSET2, skips both 32-bit
+// zero-extensions (`mov r32, 0`), folds an optional same-page literal load
+// straight into `cmp reg, [lit_base+disp]`, evaluates `setcc t1b; cmp;
+// setcc t2b; or/test t1b, t2b` in two scratch bytes, and feeds the adjacent
+// branch via cset_inst_ (consumed = 4 or 5).
 unsigned RegionEmitter::try_fuse_cset_bool(const Inst& d) {
-    if (flags_saved_ || bool_reader_ >= 0 || d.rd >= 31 || pinned(d.rd)) return 0;
+    if (flags_saved_ || bool_reader_ >= 0 || d.rd >= 31) return 0;
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     if (index_ + 4 >= n) return 0;
-    for (std::int32_t k = 1; k <= 4; ++k) {
+    const auto& p1_raw = plan_.insts[static_cast<std::size_t>(index_ + 1)];
+    const bool has_lit = p1_raw.inst.kind == Kind::load_literal;
+    const std::int32_t off = has_lit ? 1 : 0;
+    if (index_ + 4 + off >= n) return 0;
+    if (has_lit && !is_host(flags_) && std::popcount(free_gpr_) < 6) return 0;
+    for (std::int32_t k = 1; k <= 4 + off; ++k) {
         const auto& pk = plan_.insts[static_cast<std::size_t>(index_ + k)];
-        if (pk.leader || pk.pc != cur_->pc + 4u * static_cast<unsigned>(k) || pk.may_fault || pk.conservative_writes ||
-            pk.family >= 0 || pk.try_family || pk.inline_call || pk.inline_ret)
+        const bool lit_ok = has_lit && k == 1;
+        if (pk.leader || pk.pc != cur_->pc + 4u * static_cast<unsigned>(k) || (!lit_ok && pk.may_fault) ||
+            pk.conservative_writes || pk.family >= 0 || pk.try_family || pk.inline_call || pk.inline_ret)
             return 0;
-        if (k <= 3 && pk.flow != Flow::normal) return 0;
+        if (k <= 3 + off && pk.flow != Flow::normal) return 0;
     }
-    const auto& p1 = plan_.insts[static_cast<std::size_t>(index_ + 1)];
-    const auto& p2 = plan_.insts[static_cast<std::size_t>(index_ + 2)];
-    const auto& p3 = plan_.insts[static_cast<std::size_t>(index_ + 3)];
-    const auto& p4 = plan_.insts[static_cast<std::size_t>(index_ + 4)];
+    const unsigned w1 = d.rd;
+    unsigned wT = 31;
+    std::uint64_t lit_addr = 0;
+    std::uint8_t lit_bits = 32;
+    if (has_lit) {
+        const auto& pl = p1_raw.inst;
+        if (pl.mem != MemOp::load || (pl.size != 2 && pl.size != 3) || pl.rd >= 31 || pl.rd == w1) return 0;
+        lit_addr = static_cast<std::uint64_t>(pl.imm);
+        const auto lit_end = lit_addr + (std::uint64_t{1} << pl.size) - 1u;
+        // Same 4 KiB page as executing cur_->pc OR as an already-executed
+        // literal-pool load in this basic block: guaranteed mapped (never faults).
+        const bool same_pc_page =
+            ((lit_addr ^ cur_->pc) & ~4095ULL) == 0 && ((lit_end ^ cur_->pc) & ~4095ULL) == 0;
+        const bool same_lit_page = lit_base_reg_ != Gp::none &&
+                                   ((lit_addr ^ lit_base_pc_) & ~4095ULL) == 0 &&
+                                   ((lit_end ^ lit_base_pc_) & ~4095ULL) == 0;
+        if (!same_pc_page && !same_lit_page) return 0;
+        wT = pl.rd;
+        lit_bits = pl.size == 3 ? 64 : 32;
+    }
+    const auto& p1 = plan_.insts[static_cast<std::size_t>(index_ + 1 + off)];
+    const auto& p2 = plan_.insts[static_cast<std::size_t>(index_ + 2 + off)];
+    const auto& p3 = plan_.insts[static_cast<std::size_t>(index_ + 3 + off)];
+    const auto& p4 = plan_.insts[static_cast<std::size_t>(index_ + 4 + off)];
     const auto& c1 = p1.inst;
-    const bool cmp_imm = c1.kind == Kind::add_sub_imm && c1.op == 1 && c1.s && c1.rd == 31;
+    const bool cmp_imm = !has_lit && c1.kind == Kind::add_sub_imm && c1.op == 1 && c1.s && c1.rd == 31;
     const bool cmp_reg = c1.kind == Kind::add_sub_shift && c1.op == 1 && c1.s && c1.rd == 31 && c1.amount == 0;
     if (!cmp_imm && !cmp_reg) return 0;
-    const unsigned w1 = d.rd;
+    if (has_lit && (c1.sf != (p1_raw.inst.size == 3) || c1.rm != wT || c1.rn == wT)) return 0;
     if ((p1.reads >> w1) & 1u) return 0;
     const auto& c2 = p2.inst;
     if (c2.kind != Kind::csel || c2.op != 1 || c2.rn != 31 || c2.rm != 31 || c2.cond >= 14 || c2.rd >= 31 ||
-        c2.rd == w1 || pinned(c2.rd) || p2.flags_live_out)
+        c2.rd == w1 || p2.flags_live_out)
         return 0;
     const unsigned w2 = c2.rd;
     const auto& c3 = p3.inst;
     if (c3.kind != Kind::logic_shift || (c3.op != 0 && c3.op != 1) || c3.invert || c3.amount != 0 || c3.s ||
-        c3.rd >= 31 || pinned(c3.rd))
+        c3.rd >= 31)
         return 0;
     if (!((c3.rn == w1 && c3.rm == w2) || (c3.rn == w2 && c3.rm == w1))) return 0;
     const unsigned w3 = c3.rd;
@@ -1801,19 +1833,87 @@ unsigned RegionEmitter::try_fuse_cset_bool(const Inst& d) {
     const bool br_ok = (c4.kind == Kind::compare_branch && c4.rd == w3) ||
                        (c4.kind == Kind::test_branch && c4.rd == w3 && c4.amount == 0);
     if (!br_ok || p4.flags_live_in) return 0;
-    if (!gpr_dead_after(index_ + 4, w1) || !gpr_dead_after(index_ + 4, w2) || !gpr_dead_after(index_ + 4, w3))
-        return 0;
+    const std::int32_t br_idx = index_ + 4 + off;
 
+    const auto is_cold_taken = [&](std::int32_t tgt) -> bool {
+        if (tgt < 0) return true;
+        if (tgt <= br_idx || plan_.insts[static_cast<std::size_t>(tgt)].loop_header) return false;
+        std::int32_t cur_i = tgt;
+        for (int steps = 0; steps < 8 && cur_i >= 0 && cur_i < n; ++steps) {
+            const auto& pt = plan_.insts[static_cast<std::size_t>(cur_i)];
+            if (pt.flow == Flow::call || pt.flow == Flow::trap || pt.flow == Flow::interpret || pt.flow == Flow::svc)
+                return true;
+            if (pt.flow == Flow::jump) {
+                if (pt.taken < 0) return true;
+                cur_i = pt.taken;
+                continue;
+            }
+            if (pt.flow == Flow::normal) {
+                if (pt.fall < 0) return true;
+                cur_i = pt.fall;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    };
+    const bool can_cold_taken = can_defer_cold() && dead_on_ && p4.flow == Flow::cond && p4.fall == br_idx + 1 &&
+                                static_cast<std::size_t>(p4.fall) < s_.olive_in.size() && is_cold_taken(p4.taken);
+    const std::uint64_t fall_live = can_cold_taken ? s_.olive_in[static_cast<std::size_t>(p4.fall)] : ~0ULL;
+
+    // On ORR + CBZ/TBZ#0, taken implies w1==0, w2==0, w3==0.
+    // On AND + CBNZ/TBNZ#0, taken implies w1==1, w2==1, w3==1.
+    // On ORR + CBNZ or AND + CBZ, only w3's value (1 or 0) is uniquely known.
+    const bool all_known_taken = (c3.op == 1 && c4.op == 0) || (c3.op == 0 && c4.op == 1);
+    const std::uint64_t taken_val = c4.op == 0 ? 0ULL : 1ULL;
+    CsetColdFix fixes[4]{};
+    unsigned fix_count = 0;
+    const auto check_reg = [&](unsigned r, bool known_taken, bool is_lit_fix) -> bool {
+        if (gpr_dead_after(br_idx, r)) return true;
+        if (!can_cold_taken || !known_taken || ((fall_live >> r) & 1u) != 0) return false;
+        fixes[fix_count++] = {static_cast<std::uint8_t>(r), is_lit_fix, lit_bits, is_lit_fix ? lit_addr : taken_val};
+        return true;
+    };
+    if (has_lit && wT != w2 && wT != w3 && !check_reg(wT, true, true)) return 0;
+    if (w1 != w3 && !check_reg(w1, all_known_taken, false)) return 0;
+    if (w2 != w3 && !check_reg(w2, all_known_taken, false)) return 0;
+    if (!check_reg(w3, true, false)) return 0;
+
+    // Reserve an existing lit_base_reg_ in range BEFORE alloc() for t1 so t1
+    // does not clobber it and we reuse [lit_base_reg_ + delta] without movabs.
+    Gp lit_reg = Gp::none;
+    std::int32_t lit_disp = 0;
+    if (has_lit && lit_base_reg_ != Gp::none && is_free(lit_base_reg_) &&
+        !((gc_.mask >> x64::id(lit_base_reg_)) & 1u)) {
+        const auto delta = static_cast<std::int64_t>(lit_addr) - static_cast<std::int64_t>(lit_base_pc_);
+        if (delta >= -1048576 && delta <= 1048576) {
+            free_gpr_ &= ~(1u << x64::id(lit_base_reg_));
+            lit_reg = lit_base_reg_;
+            lit_disp = static_cast<std::int32_t>(delta);
+        }
+    }
     // Protect c1's cached operands from being chosen as the eviction victim by
     // alloc() for t1, avoiding a spill immediately followed by a reload.
-    if (std::popcount(free_gpr_) > 2) {
+    if (std::popcount(free_gpr_) > (has_lit && lit_reg == Gp::none ? 3 : 2)) {
         if (c1.rn < 31 && !pinned(c1.rn)) (void)borrow_gpr(c1.rn);
-        if (!cmp_imm && c1.rm < 31 && !pinned(c1.rm) && std::popcount(free_gpr_) > 2) (void)borrow_gpr(c1.rm);
+        if (!has_lit && !cmp_imm && c1.rm < 31 && !pinned(c1.rm) && std::popcount(free_gpr_) > 2)
+            (void)borrow_gpr(c1.rm);
     }
     const auto t1 = alloc();
     a_.setcc(x64::invert(condition(d.cond)), t1);
     const unsigned cbits = c1.sf ? 64 : 32;
-    if (cmp_imm) {
+    if (has_lit) {
+        if (lit_reg == Gp::none) {
+            lit_reg = alloc();
+            fixup_imm64(lit_reg, lit_addr);
+            lit_base_reg_ = lit_reg;
+            lit_base_pc_ = lit_addr;
+        }
+        const auto cn = val(c1.rn);
+        const Gp nr = cn.is_zero() ? zero_reg() : in_reg(cn);
+        a_.alu(x64::Alu::cmp, cbits, nr, ptr(lit_reg, lit_disp));
+        free_gpr_ |= 1u << x64::id(lit_reg);   // done with lit_reg; alloc() preserves lit_base_reg_ if another reg is free
+    } else if (cmp_imm) {
         const auto cn = val(c1.rn, true);
         if (cn.is_reg()) a_.cmp(cbits, cn.r, static_cast<std::int32_t>(c1.imm));
         else if (const auto h = cached_gpr(cn.g); h != Gp::none) a_.cmp(cbits, h, static_cast<std::int32_t>(c1.imm));
@@ -1826,14 +1926,20 @@ unsigned RegionEmitter::try_fuse_cset_bool(const Inst& d) {
     a_.setcc(x64::invert(condition(c2.cond)), t2);
     if (c3.op == 1) a_.alu(Alu::or_, 8, t1, t2);
     else a_.test(8, t1, t2);
-    cache_drop_guest(gc_, w1);
-    cache_drop_guest(gc_, w2);
-    cache_drop_guest(gc_, w3);
+    if (!pinned(w1)) cache_drop_guest(gc_, w1);
+    if (has_lit && !pinned(wT)) cache_drop_guest(gc_, wT);
+    if (!pinned(w2)) cache_drop_guest(gc_, w2);
+    if (!pinned(w3)) cache_drop_guest(gc_, w3);
     flags_ = FlagsState::ctx;
-    cset_inst_ = index_ + 3;
+    cset_inst_ = index_ + 3 + off;
     cset_guest_ = static_cast<std::uint8_t>(w3);
     cset_cond_ = Cond::ne;
-    return 4;
+    if (fix_count > 0) {
+        cset_cold_inst_ = br_idx;
+        cset_cold_fix_count_ = fix_count;
+        for (unsigned i = 0; i < fix_count; ++i) cset_cold_fixes_[i] = fixes[i];
+    }
+    return static_cast<unsigned>(4 + off);
 }
 
 unsigned RegionEmitter::e_csel(const Inst& d) {
@@ -1843,6 +1949,67 @@ unsigned RegionEmitter::e_csel(const Inst& d) {
     const bool pair = d.cond < 14 && is_fcmp(flags_) && fcmp_cond(d.cond).k != FcmpCond::K::single;
     if (d.cond < 14 && d.op == 1 && n.is_zero() && m.is_zero() && !pair) {
         if (const unsigned consumed = try_fuse_cset_bool(d); consumed != 0) return consumed;
+    }
+    // Dead CSET/CSETM feeding an adjacent CBZ/CBNZ or TBZ/TBNZ #0: the branch
+    // consumes host EFLAGS directly via cset_inst_. When d.rd is dead after the
+    // branch (or dead on fallthrough with a cold taken/deopt edge), skip
+    // materializing d.rd on the hot path completely.
+    if (d.cond < 14 && (d.op == 1 || d.op == 2) && n.is_zero() && m.is_zero() && !pair && d.rd < 31 && !flags_saved_ &&
+        bool_reader_ < 0 && index_ + 1 < static_cast<std::int32_t>(plan_.insts.size())) {
+        const std::int32_t br_idx = index_ + 1;
+        const auto& nxt = plan_.insts[static_cast<std::size_t>(br_idx)];
+        const bool br_ok = !nxt.leader && nxt.pc == cur_->pc + 4 && !nxt.may_fault && !nxt.conservative_writes &&
+                           nxt.family < 0 && !nxt.try_family && !nxt.inline_call && !nxt.inline_ret &&
+                           ((nxt.inst.kind == Kind::compare_branch && nxt.inst.rd == d.rd) ||
+                            (nxt.inst.kind == Kind::test_branch && nxt.inst.rd == d.rd && nxt.inst.amount == 0));
+        if (br_ok) {
+            bool elide = gpr_dead_after(br_idx, d.rd);
+            bool need_cold_fix = false;
+            if (!elide && can_defer_cold() && dead_on_ && nxt.flow == Flow::cond && nxt.fall == br_idx + 1 &&
+                static_cast<std::size_t>(nxt.fall) < s_.olive_in.size() &&
+                ((s_.olive_in[static_cast<std::size_t>(nxt.fall)] >> d.rd) & 1u) == 0) {
+                bool cold_tgt = nxt.taken < 0;
+                if (!cold_tgt && nxt.taken > br_idx && !plan_.insts[static_cast<std::size_t>(nxt.taken)].loop_header) {
+                    const auto n_inst = static_cast<std::int32_t>(plan_.insts.size());
+                    std::int32_t cur_i = nxt.taken;
+                    for (int steps = 0; steps < 8 && cur_i >= 0 && cur_i < n_inst; ++steps) {
+                        const auto& pt = plan_.insts[static_cast<std::size_t>(cur_i)];
+                        if (pt.flow == Flow::call || pt.flow == Flow::trap || pt.flow == Flow::interpret ||
+                            pt.flow == Flow::svc) {
+                            cold_tgt = true;
+                            break;
+                        }
+                        if (pt.flow == Flow::jump) {
+                            if (pt.taken < 0) { cold_tgt = true; break; }
+                            cur_i = pt.taken;
+                        } else if (pt.flow == Flow::normal) {
+                            if (pt.fall < 0) { cold_tgt = true; break; }
+                            cur_i = pt.fall;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if (cold_tgt) {
+                    elide = true;
+                    need_cold_fix = true;
+                }
+            }
+            if (elide) {
+                if (!pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+                const auto c = condition(d.cond);
+                cset_inst_ = index_;
+                cset_guest_ = static_cast<std::uint8_t>(d.rd);
+                cset_cond_ = x64::invert(c);
+                if (need_cold_fix) {
+                    const std::uint64_t tv = nxt.inst.op == 0 ? 0ULL : (d.op == 1 ? 1ULL : ones(bits));
+                    cset_cold_inst_ = br_idx;
+                    cset_cold_fix_count_ = 1;
+                    cset_cold_fixes_[0] = {static_cast<std::uint8_t>(d.rd), false, 0, tv};
+                }
+                return 1;
+            }
+        }
     }
     const auto dd = dst(d.rd);
     if (d.cond >= 14) {

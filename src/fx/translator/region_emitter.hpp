@@ -148,6 +148,7 @@ public:
     bool vec_derived(unsigned index, unsigned kind, x64::Mem& slot) override;   // tier 2
     bool vec_fp_const(unsigned index, unsigned es, unsigned width, std::uint64_t& bits) override;   // p3
     bool vec_fp_quiet(unsigned index, unsigned es) override;                                       // p3
+    bool vec_fp_non_nan(unsigned index, unsigned es) override;                                     // p3
     [[nodiscard]] bool host_flags_live() const override {
         return is_host(flags_) && !flags_saved_ &&
                (bool_reader_ >= 0 || cur_reads_flags_ || (live_out_ && !cur_writes_flags_));
@@ -534,6 +535,19 @@ private:
     std::int32_t cset_inst_{-1};
     std::uint8_t cset_guest_{31};
     Cond cset_cond_{Cond::e};
+    // Fallthrough-dead CSET / CSET-bool fusion: when elided guest registers are
+    // dead on the fallthrough path of adjacent branch `cset_cold_inst_` but live
+    // on its cold taken edge, cond_branch routes taken through a deferred cold
+    // stub that materializes their exact architectural values before jumping to `taken`.
+    struct CsetColdFix {
+        std::uint8_t guest{31};
+        bool is_lit{};
+        std::uint8_t lit_bits{};
+        std::uint64_t val{};
+    };
+    std::int32_t cset_cold_inst_{-1};
+    unsigned cset_cold_fix_count_{0};
+    CsetColdFix cset_cold_fixes_[4]{};
     bool folded_access_{};
     // Per-block literal-pool base register reuse (e_load_literal): when a free
     // uncached scratch GPR still holds a previously materialized literal pool

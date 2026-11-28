@@ -1571,7 +1571,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         auto& pi = plan.insts[static_cast<std::size_t>(br)];
         pi.table = static_cast<std::int32_t>(plan.tables.size());
         plan.tables.push_back({static_cast<std::uint32_t>(plan.table_pcs.size()), ft.count, ft.index_reg, ft.by_target,
-                               ft.straight_bound, false, ft.table_reg, ft.table_addr});
+                               ft.straight_bound, false, false, ft.table_reg, ft.table_addr});
         for (std::uint32_t k = 0; k < ft.count; ++k) {
             const auto t = found_pcs[ft.first + k];
             plan.table_pcs.push_back(t);
@@ -1715,7 +1715,11 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         if (!tbl.proven_bounded) continue;
         const auto bidx = find_index(ft.bound_pc);
         bool ok = bidx >= 0 && bidx < br;
-        if (ok && ft.need_zext32 && !(ext_facts(plan, br, ft.index_reg) & ext_zero32)) ok = false;
+        bool need_guard64 = false;
+        if (ok && ft.need_zext32 && !(ext_facts(plan, br, ft.index_reg) & ext_zero32)) {
+            if (!tbl.by_target && tbl.count <= 0x7fffffffu) need_guard64 = true;
+            else ok = false;
+        }
         for (std::int32_t j = bidx; ok && j < br; ++j) {
             const auto& pj = plan.insts[static_cast<std::size_t>(j)];
             const auto& nxt = plan.insts[static_cast<std::size_t>(j + 1)];
@@ -1731,6 +1735,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             }
         }
         tbl.proven_bounded = ok;
+        tbl.guard_index64 = ok && need_guard64;
     }
 
     // Flags liveness (backward). Exits treat flags as live, except calls and
@@ -1807,8 +1812,9 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                                             : exit_live(plan.table_pcs[tbl.first + k]);
                     }
                     tbl.cases_flags_dead = !cases_live;
-                    out = (tbl.proven_bounded && tbl.table_reg < 0) ? cases_live
-                                                                    : (strict_flags || cases_live || br_live(i));
+                    out = (tbl.proven_bounded && tbl.table_reg < 0 && !tbl.guard_index64)
+                              ? cases_live
+                              : (strict_flags || cases_live || br_live(i));
                 } else {
                     out = strict_flags || (pi.inst.kind != Kind::ret && br_live(i));
                 }

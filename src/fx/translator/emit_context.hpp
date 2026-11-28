@@ -404,6 +404,15 @@ public:
         (void)es;
         return false;
     }
+    // True if, at the start of this instruction, no `es`-bit element (32 or 64)
+    // of V`index` can be any NaN (quiet or signalling) on any path: e.g. from
+    // SCVTF/UCVTF, a non-NaN constant, or FMAXNM/FMINNM with a quiet and a
+    // non-NaN operand. Default: unknown.
+    virtual bool vec_fp_non_nan(unsigned index, unsigned es) {
+        (void)index;
+        (void)es;
+        return false;
+    }
     // ---- cold out-of-line stubs & host flags liveness (additive) -------------
     // True if host EFLAGS currently hold live guest NZCV that must be
     // preserved (flag-clobbering checks should call clobber_host_flags() or

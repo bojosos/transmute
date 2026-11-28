@@ -411,7 +411,7 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     flags_ = FlagsState::ctx;
     const bool direct_bounded = t.proven_bounded && !t.by_target;
     if (!direct_bounded) load(64, Gp::rcx, val(pi.inst.rn));          // target
-    if (!t.by_target) load(32, Gp::rdx, val(t.index_reg));   // index (UXTW)
+    if (!t.by_target) load(direct_bounded && t.guard_index64 ? 64 : 32, Gp::rdx, val(t.index_reg));   // index
     reset_cache(gc_);                            // clean (stored): the context holds every value
     reset_cache(vc_);
     forget_vec_zero();
@@ -429,16 +429,23 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
                            : add_stub(Stub::K::direct_exit, FlagsState::ctx, dirty, plan_.table_pcs[t.first + k], -1, -1);
     };
     if (direct_bounded) {
-        // Proven immutable image code + straight-line bound check: wI < count
-        // and every table target is exact, so dispatch directly through a dense
-        // 4-byte host offset table. If the table pointer was hoisted before a
-        // loop (t.table_reg >= 0), guard it with one compare against table_addr
-        // so the host table load runs in parallel with the guest table load.
+        // Proven immutable image code + straight-line bound check: dispatch
+        // directly through a dense 4-byte host offset table in parallel with
+        // the guest table load. Guard 64-bit LSL indices whose upper 32 bits
+        // were not statically proven zero (`cmp rdx, count; jae generic`) and
+        // hoisted table pointers (`cmp xT, table_addr; jne generic`).
+        const bool has_guard = t.table_reg >= 0 || t.guard_index64;
         x64::Label generic{};
-        if (t.table_reg >= 0) {
+        if (has_guard) {
             generic = cold ? add_stub(Stub::K::indirect_exit, FlagsState::ctx, dirty, 0,
                                       static_cast<std::int32_t>(pi.inst.rn))
                            : a_.new_label();
+        }
+        if (t.guard_index64) {
+            a_.cmp(64, Gp::rdx, static_cast<std::int32_t>(t.count));
+            a_.jcc(Cond::ae, generic);
+        }
+        if (t.table_reg >= 0) {
             fixup_imm64(Gp::rax, t.table_addr);
             const auto tv = val(static_cast<unsigned>(t.table_reg));
             if (tv.is_reg()) a_.cmp(64, tv.r, Gp::rax);
@@ -449,7 +456,7 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
         a_.movsx(64, Gp::r9, ptr(Gp::r8, Gp::rdx, 4), 32);
         a_.add(64, Gp::r9, Gp::r8);
         a_.jmp(Gp::r9);
-        if (t.table_reg >= 0 && !cold) {
+        if (has_guard && !cold) {
             a_.bind(generic);
             const auto v = val(pi.inst.rn);
             if (v.is_reg()) a_.mov(64, Gp::rcx, v.r);

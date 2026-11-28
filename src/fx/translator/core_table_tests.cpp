@@ -1153,3 +1153,81 @@ FX_TEST(table_dispatch_hoisted_guarded) {
     FX_CHECK(r.run(w, ctx2, "hoisted guarded fallback swap"));
     if (tables_enabled()) FX_CHECK(r.last.lookups >= 1u);
 }
+
+// Wave U2: 32-bit `CMP wI, #3; B.HI` guarding 64-bit `LDRSW xO, [xT, xI, LSL #2]`
+// when xI is NOT proven zero-extended in the region (Cycles Blender+0x2e48e0c):
+// dense 4-byte host offset table with `cmp rdx, count; jae generic` guard.
+// Tests both non-hoisted and hoisted table pointers, fast path (upper 32 bits == 0
+// -> 0 lookups) AND non-zero upper 32 bits ((0x40000000ULL << 32) | k -> LSL #2
+// wraps identically to 4*k while tripping `cmp rdx, 4; jae generic` -> exact fallback).
+FX_TEST(table_dispatch_lsl_guard_index64) {
+    auto& r = runner();
+    using namespace a64;
+    for (const bool hoisted : {false, true}) {
+        std::vector<std::uint32_t> w;
+        w.push_back(movw(false, 2, 0, 16, 12));                         // movz w12, #16
+        std::size_t adr_tab_at = 0;
+        if (hoisted) {
+            adr_tab_at = w.size();
+            w.push_back(adr(false, 0, 8));                              // adr x8, table (hoisted!)
+        }
+        const auto dispatch = w.size();
+        // 64-bit arithmetic on x11 so ext_zero32 is NOT proven!
+        w.push_back(add_imm(true, false, false, 11, 11, 1));            // add x11, x11, #1
+        w.push_back(logic_shift(true, 0, 0, false, 14, 0, 11, 11));     // and x11, x11, x14 (mask keeps upper bits!)
+        w.push_back(add_imm(false, true, true, 31, 11, 3));             // cmp w11, #3 (32-bit bound!)
+        const auto b_hi_at = w.size();
+        w.push_back(bcond(8, 0));                                       // b.hi default
+        if (!hoisted) {
+            adr_tab_at = w.size();
+            w.push_back(adr(false, 0, 8));                              // adr x8, table
+        }
+        const auto adr_base_at = w.size();
+        w.push_back(adr(false, 0, 9));                                  // adr x9, base
+        w.push_back(ldst_reg(2, 2, 11, 3, true, 8, 10));                // ldrsw x10, [x8, x11, lsl #2]
+        w.push_back(add_shift(true, false, false, 0, 10, 0, 9, 9));     // add x9, x9, x10
+        w.push_back(br(9));                                             // br x9
+        std::size_t case_at[4]{};
+        std::vector<std::size_t> to_tail;
+        for (unsigned k = 0; k < 4; ++k) {
+            case_at[k] = w.size();
+            w.push_back(add_imm(true, false, false, 0, 0, 13 + k * 5));
+            to_tail.push_back(w.size());
+            w.push_back(b(0));
+        }
+        const auto def_at = w.size();
+        w.push_back(add_imm(true, false, false, 0, 0, 88));
+        const auto tail = w.size();
+        w.push_back(add_imm(false, true, true, 12, 12, 1));             // subs w12, w12, #1
+        w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+        const auto to_end = w.size();
+        w.push_back(b(0));
+        const auto tab_at = w.size();
+        for (unsigned k = 0; k < 4; ++k) {
+            const auto off = static_cast<std::int32_t>(
+                4 * (static_cast<std::int64_t>(case_at[k]) - static_cast<std::int64_t>(adr_base_at)));
+            w.push_back(static_cast<std::uint32_t>(off));
+        }
+        const auto end = w.size();
+        w[b_hi_at] = bcond(8, static_cast<std::int32_t>(def_at) - static_cast<std::int32_t>(b_hi_at));
+        w[adr_tab_at] = adr(false, static_cast<std::int32_t>(4 * (tab_at - adr_tab_at)), 8);
+        for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+        w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+
+        // 1. Fast path: upper 32 bits of x11 == 0 -> dense 4-byte table with 0 lookups.
+        auto ctx1 = r.context(hoisted ? 0x7301 : 0x7300);
+        ctx1.x[11] = 0;
+        ctx1.x[14] = 3;
+        FX_CHECK(r.run(w, ctx1, hoisted ? "u2 guard_index64 hoisted fast" : "u2 guard_index64 fast"));
+        if (tables_enabled()) FX_CHECK_EQ(r.last.lookups, 0u);
+
+        // 2. Non-zero upper 32 bits: x11 has bit 62 set (0x40000000_0000000k).
+        //    `w11 <= 3` passes CMP w11, #3; `x11 << 2 == 4*k` wraps cleanly so the
+        //    guest LDRSW reads valid table[k]; `cmp rdx, 4; jae generic` trips exact fallback!
+        auto ctx2 = r.context(hoisted ? 0x7311 : 0x7310);
+        ctx2.x[11] = 0x4000000000000000ULL;
+        ctx2.x[14] = 0x4000000000000003ULL;
+        FX_CHECK(r.run(w, ctx2, hoisted ? "u2 guard_index64 hoisted fallback" : "u2 guard_index64 fallback"));
+        if (tables_enabled()) FX_CHECK(r.last.lookups >= 1u);
+    }
+}

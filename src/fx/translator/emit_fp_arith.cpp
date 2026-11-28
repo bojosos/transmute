@@ -269,7 +269,7 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     };
     const auto any_zero = [sign_bit](std::uint64_t v) { return v == 0 || v == sign_bit; };
     const unsigned span = s.scalar ? es : w;
-    enum class Match { none, scalar_quiet_nan, deferred_single };
+    enum class Match { none, one_insn, scalar_quiet_nan, deferred_single };
     std::uint64_t matched_c = 0;
     const auto classify = [&](unsigned c_reg, unsigned x_reg) -> Match {
         std::uint64_t c = 0;
@@ -277,6 +277,7 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
         const bool is_norm = normal(c);
         if (!is_norm && !any_zero(c)) return Match::none;
         matched_c = c;
+        if (e.ctx.vec_fp_non_nan(x_reg, es)) return Match::one_insn;
         if (s.scalar && e.ctx.vec_fp_quiet(x_reg, es) && (is_norm || exact_zero(c)) &&
             e.ctx.can_defer_cold() && !e.ctx.host_flags_live())
             return Match::scalar_quiet_nan;
@@ -285,10 +286,10 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     };
     unsigned cr = in.rm, xr = in.rn;
     Match match = classify(in.rm, in.rn);
-    if (match == Match::none || (match == Match::deferred_single && in.rn != in.rm)) {
+    if (match != Match::one_insn && in.rn != in.rm) {
         const std::uint64_t first_c = matched_c;
         const Match alt = classify(in.rn, in.rm);
-        if (alt != Match::none && (match == Match::none || (match == Match::deferred_single && alt != Match::deferred_single))) {
+        if (alt != Match::none && (match == Match::none || static_cast<int>(alt) < static_cast<int>(match))) {
             match = alt;
             cr = in.rn;
             xr = in.rm;
@@ -298,6 +299,17 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     }
     if (match == Match::none) return false;
     const Xmm x = e.vec(xr), cv = e.vec(cr);
+    if (match == Match::one_insn) {
+        // Both x and c are proven non-NaN: a single x64 vmax/vmin is 100%
+        // bit-exact and never sets MXCSR.IE. Order (first, second) so a +-0 tie
+        // returns A64's exact signed zero (x64 returns the 2nd operand on tie).
+        const bool c_second = normal(matched_c) || exact_zero(matched_c);
+        const bool zero = s.scalar ? e.zero_above(c_second ? xr : cr, w) : w == 128;
+        const Xmm d = e.dest(in.rd);
+        e.op(s.pick(is_max ? fops::max : fops::min), d, c_second ? x : cv, c_second ? cv : x);
+        if (!zero) e.zero_upper(d, w);
+        return true;
+    }
     if (match == Match::scalar_quiet_nan) {
         e.ctx.clobber_host_flags();
         const Xmm nan_val = nm ? cv : x;
@@ -693,7 +705,7 @@ void minmax_exact_core(FpEmit& e, K kind, Shape s, unsigned width, Xmm T, Xmm a,
 // when host flags are dead (scalar: vucomiss/sd + jp; 128-bit vector: vptest
 // + jnz). Cold stub saves/restores 2-3 XMMs to GuestContext::vspill[28..30].
 void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xmm a, Xmm b, Xmm t0,
-                           bool flags_live, const LaneGuard& guard) {
+                           bool flags_live, const LaneGuard& guard, bool sz_dead = false) {
     const bool nm = kind == K::fmaxnm || kind == K::fminnm;
     const bool is_max = kind == K::fmax || kind == K::fmaxnm;
     const bool dbl = s.dbl();
@@ -737,9 +749,13 @@ void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xm
     }
 
     // Numeric fast path: safe even when d == a or d == b (t0 != a, b, d).
-    e.op(mm, t0, b, a);
-    e.op(mm, d, a, b);
-    e.op(is_max ? and_ : or_, d, d, t0);
+    if (sz_dead) {
+        e.op(mm, d, a, b);
+    } else {
+        e.op(mm, t0, b, a);
+        e.op(mm, d, a, b);
+        e.op(is_max ? and_ : or_, d, d, t0);
+    }
     e.as.bind(done);
 
     const Mem quiet = e.ksplat(s.es, dbl ? 0x0008000000000000ull : 0x00400000ull);
@@ -838,7 +854,8 @@ void emit_minmax_exact(FpEmit& e, const Inst& in, Shape s, unsigned w) {
         }
         const Xmm t0 = e.tmp();
         const Xmm d = e.dest(in.rd);
-        minmax_exact_deferred(e, in.k, s, w, d, a, b, t0, flags_live, guard);
+        const bool sz_dead = !s.scalar && (s.es == 32 || s.es == 64) && e.ctx.vec_sz_dead_after(1, in.rd, s.es);
+        minmax_exact_deferred(e, in.k, s, w, d, a, b, t0, flags_live, guard, sz_dead);
         if (!zero) e.zero_upper(d, w);
         return;
     }
@@ -1017,9 +1034,13 @@ unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words) {
         if (dead && !overwritten) dead = e.ctx.vec_sz_dead_after(len, g, es);
         sz_dead[i] = dead;
     }
-    // Drop inputs proven to hold a non-NaN constant (finite or +/-inf).
+    // Drop inputs proven non-NaN (from SCVTF/UCVTF, FMAXNM/FMINNM, or a non-NaN constant).
     for (std::uint32_t m = nan_inputs; m; m &= m - 1) {
         const auto g = static_cast<unsigned>(std::countr_zero(m));
+        if (e.ctx.vec_fp_non_nan(g, es)) {
+            nan_inputs &= ~(1u << g);
+            continue;
+        }
         std::uint64_t cbits = 0;
         if (e.ctx.vec_fp_const(g, es, 128, cbits)) {
             const bool is_nan =

@@ -1719,3 +1719,199 @@ FX_TEST(core_wave_q2_ccmp_defer_and_cset_bool_fusion) {
     }
     r.machine.options.optimize = saved_opt;
 }
+
+// Wave U1:
+// 1. U1a: Dead CSET/CSETM elision before adjacent CBZ/CBNZ/TBZ#0/TBNZ#0
+//    (both unpinned and pinned destinations, plus live-destination control).
+// 2. U1b: Branchless dead-CSET byte-OR/AND fusion across 1 same-page LDR_lit
+//    (`CSET; LDR wT/xT, =lit; CMP wX/xX, wT/xT; CSET; ORR/AND; CBZ/CBNZ/TBNZ#0`),
+//    including lit_base_reg_ reuse, w2==wT register reuse, and live-wT control.
+FX_TEST(core_wave_u1_dead_cset_and_lit_cset_bool) {
+    auto& r = runner();
+    using namespace a64;
+    const auto ldr_lit = [](bool x64_sz, std::int32_t word_off, unsigned rt) {
+        return (x64_sz ? 0x58000000u : 0x18000000u) | ((static_cast<std::uint32_t>(word_off) & 0x7ffffu) << 5) | rt;
+    };
+    const auto saved_opt = r.machine.options.optimize;
+    r.machine.options.optimize = 1;
+
+    // 1. U1a: Dead CSET/CSETM + CBZ/CBNZ/TBZ#0/TBNZ#0 vs live control.
+    const std::vector<std::uint32_t> dead_cset = {
+        // (a) Dead CSET -> CBZ (w8 overwritten on both paths)
+        add_shift(false, true, true, 0, 2, 0, 1, 31),       // 0  cmp w1, w2
+        csel(false, false, 31, 1, 1, 31, 8),                // 1  cset w8, eq
+        cbz(false, false, 2, 8),                            // 2  cbz w8, +2 (4)
+        add_imm(true, false, false, 0, 0, 11),              // 3  add x0, x0, #11
+        movw(false, 2, 0, 0, 8),                            // 4  mov w8, #0 (kills w8 on both paths)
+        // (b) Dead CSETM -> TBNZ #0 (x9 overwritten on both paths)
+        add_shift(true, true, true, 0, 3, 0, 1, 31),        // 5  cmp x1, x3
+        csel(true, true, 31, 10, 0, 31, 9),                 // 6  csetm x9, lt (CSINV x9, xzr, xzr, ge)
+        tbz(true, 0, 2, 9),                                 // 7  tbnz w9, #0, +2 (9)
+        add_imm(true, false, false, 0, 0, 17),              // 8  add x0, x0, #17
+        movw(true, 2, 0, 0, 9),                             // 9  mov x9, #0 (kills x9)
+        // (c) Dead CSET -> CBNZ with pinned-candidate x19 (used heavily, then killed)
+        add_imm(true, false, false, 19, 19, 1),             // 10
+        add_imm(true, false, false, 19, 19, 2),             // 11
+        add_imm(true, false, false, 19, 19, 3),             // 12
+        add_shift(false, true, true, 0, 4, 0, 1, 31),       // 13 cmp w1, w4
+        csel(false, false, 31, 0, 1, 31, 19),               // 14 cset w19, ne
+        cbz(false, true, 2, 19),                            // 15 cbnz w19, +2 (17)
+        add_imm(true, false, false, 0, 0, 23),              // 16 add x0, x0, #23
+        movw(true, 2, 0, 5, 19),                            // 17 mov x19, #5 (kills x19)
+        // (d) Control: LIVE CSETM -> TBZ #0 (must materialize -1 / 0 in x10!)
+        add_shift(false, true, true, 0, 2, 0, 1, 31),       // 18 cmp w1, w2
+        csel(true, true, 31, 1, 0, 31, 10),                 // 19 csetm x10, eq
+        tbz(false, 0, 2, 10),                               // 20 tbz w10, #0, +2 (22)
+        add_imm(true, false, false, 0, 0, 31),              // 21 add x0, x0, #31
+        add_shift(true, false, false, 0, 10, 0, 0, 0),      // 22 add x0, x0, x10 (observes full 64-bit x10!)
+    };
+    for (unsigned k = 0; k < 16; ++k) {
+        auto ctx = r.context(0x14000 + k);
+        ctx.x[1] = (k & 3);
+        ctx.x[2] = 1;
+        ctx.x[3] = 2;
+        ctx.x[4] = 3;
+        ctx.x[8] = 0xdeadbeefcafebabeULL;
+        ctx.x[9] = 0xfeedface12345678ULL;
+        ctx.x[10] = 0xabcdef0123456789ULL;
+        FX_CHECK(r.run(dead_cset, ctx, "wave u1a dead cset/csetm " + std::to_string(k)));
+    }
+    // Codegen size check: dead CSET+CBZ must emit fewer hot bytes than live CSET+CBZ.
+    const auto cset_dead_reg = translate_words({
+        add_shift(false, true, true, 0, 2, 0, 1, 31),
+        csel(false, false, 31, 1, 1, 31, 8),
+        cbz(false, false, 2, 8),
+        add_imm(true, false, false, 0, 0, 1),
+        movw(false, 2, 0, 0, 8),
+        ret(),
+    }, false);
+    const auto cset_live_reg = translate_words({
+        add_shift(false, true, true, 0, 2, 0, 1, 31),
+        csel(false, false, 31, 1, 1, 31, 8),
+        cbz(false, false, 2, 8),
+        add_imm(true, false, false, 0, 0, 1),
+        add_shift(true, false, false, 0, 8, 0, 0, 0),
+        ret(),
+    }, false);
+    FX_CHECK(cset_dead_reg.stats.hot_bytes < cset_live_reg.stats.hot_bytes);
+
+    // 2. U1b: Branchless CSET; LDR_lit; CMP; CSET; ORR/AND; CBZ/TBNZ#0 (32-bit & 64-bit)
+    //    plus consecutive lit_base_reg_ reuse, w2==wT reuse, and live-wT control.
+    std::vector<std::uint32_t> lit_bool = {
+        // (a) 32-bit V8 2-map check: LDR w16, =map1; CMP w1, w16; CSET w8, eq;
+        //     LDR w16, =map2; CMP w1, w16; CSET w9, eq; ORR w9, w8, w9; CBZ w9
+        ldr_lit(false, 0, 16),                              // 0  ldr w16, =lit32_a (patched below)
+        add_shift(false, true, true, 0, 16, 0, 1, 31),      // 1  cmp w1, w16
+        csel(false, false, 31, 1, 1, 31, 8),                // 2  cset w8, eq
+        ldr_lit(false, 0, 16),                              // 3  ldr w16, =lit32_b (reuses lit_base_reg_!)
+        add_shift(false, true, true, 0, 16, 0, 1, 31),      // 4  cmp w1, w16
+        csel(false, false, 31, 1, 1, 31, 9),                // 5  cset w9, eq
+        logic_shift(false, 1, 0, false, 8, 0, 9, 9),        // 6  orr w9, w9, w8
+        cbz(false, false, 2, 9),                            // 7  cbz w9, +2 (9)
+        add_imm(true, false, false, 0, 0, 19),              // 8  add x0, x0, #19
+        // (b) 64-bit AND + TBNZ #0 with w2 == wT (w16 reused as c2.rd!)
+        add_imm(true, true, true, 2, 31, 5),                // 9  cmp x2, #5
+        csel(false, false, 31, 10, 1, 31, 8),               // 10 cset w8, lt
+        ldr_lit(true, 0, 16),                               // 11 ldr x16, =lit64_a (patched below)
+        add_shift(true, true, true, 0, 16, 0, 3, 31),       // 12 cmp x3, x16
+        csel(false, false, 31, 1, 1, 31, 16),               // 13 cset w16, eq (w2 == wT!)
+        logic_shift(false, 0, 0, false, 8, 0, 16, 9),       // 14 and w9, w16, w8
+        tbz(true, 0, 2, 9),                                 // 15 tbnz w9, #0, +2 (17)
+        add_imm(true, false, false, 0, 0, 29),              // 16 add x0, x0, #29
+        // Kill w8, w9, w16 on both paths:
+        movw(false, 2, 0, 0, 8),                            // 17 mov w8, #0
+        movw(false, 2, 0, 0, 9),                            // 18 mov w9, #0
+        movw(false, 2, 0, 0, 16),                           // 19 mov w16, #0
+        // (c) Control: w16 IS live after CBZ (must NOT elide load into w16!)
+        add_imm(false, true, true, 1, 31, 7),               // 20 cmp w1, #7
+        csel(false, false, 31, 1, 1, 31, 8),                // 21 cset w8, eq
+        ldr_lit(false, 0, 16),                              // 22 ldr w16, =lit32_b (patched below)
+        add_shift(false, true, true, 0, 16, 0, 1, 31),      // 23 cmp w1, w16
+        csel(false, false, 31, 1, 1, 31, 9),                // 24 cset w9, eq
+        logic_shift(false, 1, 0, false, 8, 0, 9, 9),        // 25 orr w9, w9, w8
+        cbz(false, false, 2, 9),                            // 26 cbz w9, +2 (28)
+        add_imm(true, false, false, 0, 0, 37),              // 27 add x0, x0, #37
+        add_shift(true, false, false, 0, 16, 0, 0, 0),      // 28 add x0, x0, x16 (observes w16!)
+        b(5),                                               // 29 b end (34)
+        // Literal pool (same 4 KiB page):
+        0x11223344u,                                        // 30 lit32_a
+        0x55667788u,                                        // 31 lit32_b
+        0x99aabbccu,                                        // 32 lit64_a lo
+        0x00112233u,                                        // 33 lit64_a hi
+        nop(),                                              // 34 end
+    };
+    lit_bool[0] = ldr_lit(false, 30 - 0, 16);
+    lit_bool[3] = ldr_lit(false, 31 - 3, 16);
+    lit_bool[11] = ldr_lit(true, 32 - 11, 16);
+    lit_bool[22] = ldr_lit(false, 31 - 22, 16);
+    for (unsigned k = 0; k < 12; ++k) {
+        auto ctx = r.context(0x14100 + k);
+        ctx.x[1] = (k % 3 == 0) ? 0x11223344u : (k % 3 == 1) ? 0x55667788u : 0x7u;
+        ctx.x[2] = (k & 4) ? 2u : 9u;
+        ctx.x[3] = (k & 2) ? 0x0011223399aabbccULL : 0x123456789abcdef0ULL;
+        ctx.x[8] = 0xaaaaaaaa11111111ULL;
+        ctx.x[9] = 0xbbbbbbbb22222222ULL;
+        ctx.x[16] = 0xcccccccc33333333ULL;
+        FX_CHECK(r.run(lit_bool, ctx, "wave u1b lit cset bool fusion " + std::to_string(k)));
+    }
+
+    // 3. U1a/U1b fallthrough-dead cold-taken materialization (V8 deopt exit idiom):
+    //    both pinned and unpinned registers, ORR+CBZ -> exit (w1=0, w2=0, w3=0,
+    //    wT=lit reload), AND+CBNZ -> exit (w1=1, w2=1, w3=1), and 32/64-bit CSETM
+    //    -> CBNZ exit (0xffffffff / ~0ULL). Exercises BOTH fallthrough AND taken!
+    std::vector<std::uint32_t> cold_deopt = {
+        // Pin pressure on x19, x20:
+        add_imm(true, false, false, 19, 19, 1),             // 0
+        add_imm(true, false, false, 19, 19, 2),             // 1
+        add_imm(true, false, false, 20, 20, 1),             // 2
+        add_imm(true, false, false, 20, 20, 2),             // 3
+        // (a) V8 2-map check with pinned w19, w20 + unpinned w16, exiting on CBZ!
+        ldr_lit(false, 0, 16),                              // 4  ldr w16, =map1 (sets lit_base_reg_)
+        add_shift(false, true, true, 0, 16, 0, 1, 31),      // 5  cmp w1, w16
+        csel(false, false, 31, 1, 1, 31, 19),               // 6  cset w19, eq (pinned!)
+        ldr_lit(false, 0, 16),                              // 7  ldr w16, =map2 (same lit page!)
+        add_shift(false, true, true, 0, 16, 0, 1, 31),      // 8  cmp w1, w16
+        csel(false, false, 31, 1, 1, 31, 20),               // 9  cset w20, eq (pinned!)
+        logic_shift(false, 1, 0, false, 19, 0, 20, 20),     // 10 orr w20, w20, w19
+        cbz(false, false, 16, 20),                          // 11 cbz w20, deopt_exit (27 = out of region!)
+        // Hot fallthrough kills w19, w20, w16:
+        movw(false, 2, 0, 1, 19),                           // 12 mov w19, #1
+        movw(false, 2, 0, 2, 20),                           // 13 mov w20, #2
+        movw(false, 2, 0, 3, 16),                           // 14 mov w16, #3
+        // (b) 32-bit CSETM w8 -> CBNZ exit (must materialize 0x00000000ffffffff on taken!)
+        add_imm(false, true, true, 31, 2, 7),               // 15 cmp w2, #7
+        csel(false, true, 31, 1, 0, 31, 8),                 // 16 csetm w8, eq
+        cbz(false, true, 11, 8),                            // 17 cbnz w8, exit (28 = out of region!)
+        movw(false, 2, 0, 4, 8),                            // 18 kills w8 on fallthrough
+        // (c) 64-bit CSETM x9 -> CBNZ exit (must materialize 0xffffffffffffffff on taken!)
+        add_imm(false, true, true, 31, 2, 8),               // 19 cmp w2, #8
+        csel(true, true, 31, 1, 0, 31, 9),                  // 20 csetm x9, eq
+        cbz(true, true, 8, 9),                              // 21 cbnz x9, exit (29 -> wait, target end!)
+        movw(true, 2, 0, 5, 9),                             // 22 kills x9 on fallthrough
+        b(4),                                               // 23 b end (27)
+        // Literal pool (placed > 4 KiB away? Same block small test here; lit_base_pc_ also covers far):
+        0x22334455u,                                        // 24 map1
+        0x66778899u,                                        // 25 map2
+        nop(),                                              // 26
+        nop(),                                              // 27 end (stop target!)
+    };
+    cold_deopt[4] = ldr_lit(false, 24 - 4, 16);
+    cold_deopt[7] = ldr_lit(false, 25 - 7, 16);
+    cold_deopt[11] = cbz(false, false, 27 - 11, 20);
+    cold_deopt[17] = cbz(false, true, 27 - 17, 8);
+    cold_deopt[21] = cbz(true, true, 27 - 21, 9);
+    for (unsigned k = 0; k < 12; ++k) {
+        auto ctx = r.context(0x14200 + k);
+        // k%3==2 triggers CBZ deopt exit -> oracle verifies exact w19=0, w20=0, w16=0x66778899!
+        ctx.x[1] = (k % 3 == 0) ? 0x22334455u : (k % 3 == 1) ? 0x66778899u : 0x99999999u;
+        // k/3 == 1 triggers 32-bit CSETM taken; k/3 == 2 triggers 64-bit CSETM taken!
+        ctx.x[2] = (k / 3 == 1) ? 7u : (k / 3 == 2) ? 8u : 1u;
+        ctx.x[8] = 0xdeadbeef11111111ULL;
+        ctx.x[9] = 0xcafebabe22222222ULL;
+        ctx.x[16] = 0x123456789abcdef0ULL;
+        ctx.x[19] = 0x1111222233334444ULL;
+        ctx.x[20] = 0x5555666677778888ULL;
+        FX_CHECK(r.run(cold_deopt, ctx, "wave u1 cold-taken materialize " + std::to_string(k)));
+    }
+    r.machine.options.optimize = saved_opt;
+}

@@ -3264,3 +3264,132 @@ FX_TEST(fp_region_tiny_before_rounding_flags) {
     std::printf("    %u runs match the oracle (FPSR, results, NZCV); UFC set in %u\n", runs, ufc);
     FX_CHECK(ufc > 0);
 }
+
+// Wave U3 + U4:
+// 1. U3: vec_fp_non_nan (SCVTF/UCVTF + FMAXNM/FMINNM clamp chains) -> 1-insn
+//    constant vmax/vmin with exact signed-zero and zero spurious FPSR.IOC.
+// 2. U4: Transitive vec_sz_dead_after across FMIN/FMAX/FNEG/MOV -> FCMGE
+//    (Embree BVH8 split minmax chain + standalone vector minmax + live control).
+FX_TEST(fp_region_wave_u_non_nan_and_sz_prop) {
+    ensure_registered();
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    constexpr std::uint32_t kMsrFpsrXzr = 0xd51b443fu;
+    constexpr std::uint32_t kMrsX0Fpsr = 0xd53b4420u;
+    const auto pack4 = [](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return std::pair<std::uint64_t, std::uint64_t>{
+            static_cast<std::uint64_t>(a) | (static_cast<std::uint64_t>(b) << 32),
+            static_cast<std::uint64_t>(c) | (static_cast<std::uint64_t>(d) << 32),
+        };
+    };
+
+    // 1. U3a: SCVTF/UCVTF (scalar S/D + vector .4S/.2D) -> constant FMAX/FMIN/FMAXNM/FMINNM
+    //    against +0.0, -0.0, 1.0 in both operand orders (must be bit-exact on +-0 and IOC==0).
+    const std::vector<std::uint32_t> u3_scvtf = {
+        kMsrFpsrXzr,
+        0x1e220021u,   // scvtf s1, w1            (non_nan32 & non_nan64)
+        0x1e214022u,   // fneg  s2, s1            (preserves non_nan; yields -0.0 when w1==0!)
+        0x1e2703e3u,   // fmov  s3, wzr           (+0.0)
+        0x1e214064u,   // fneg  s4, s3            (-0.0)
+        0x1e2e1005u,   // fmov  s5, #1.0
+        0x1e234846u,   // fmax  s6, s2, s3        (max(-0,+0) = +0!)
+        0x1e245827u,   // fmin  s7, s1, s4        (min(+0,-0) = -0!)
+        0x1e244848u,   // fmax  s8, s2, s4        (c_second=false: max(-0,-0) = -0; max(+0,-0) = +0!)
+        0x1e235829u,   // fmin  s9, s1, s3        (c_second=false: min(+0,+0) = +0; min(-0,+0) = -0!)
+        0x1e25682au,   // fmaxnm s10, s1, s5
+        0x1e2178abu,   // fminnm s11, s5, s1      (constant in rn!)
+        0x9e63004cu,   // ucvtf d12, x2           (non_nan64)
+        0x9e6703edu,   // fmov  d13, xzr          (+0.0)
+        0x1e6141aeu,   // fneg  d14, d13          (-0.0)
+        0x1e6e598fu,   // fmin  d15, d12, d14     (min(+0,-0) = -0)
+        0x1e6d5990u,   // fmin  d16, d12, d13     (c_second=false)
+        0x4e21d811u,   // scvtf v17.4s, v0.4s     (vector non_nan32)
+        0x6ea0f932u,   // fneg  v18.4s, v17.4s    (vector -0.0 when lane==0!)
+        0x4f000413u,   // movi  v19.4s, #0        (+0.0)
+        0x6ea0fa74u,   // fneg  v20.4s, v19.4s    (-0.0)
+        0x4e33f655u,   // fmax  v21.4s, v18.4s, v19.4s (max(-0,+0) = +0)
+        0x4eb4f636u,   // fmin  v22.4s, v17.4s, v20.4s (min(+0,-0) = -0)
+        0x4e34f637u,   // fmax  v23.4s, v17.4s, v20.4s (c_second=false: max(+0,-0) = +0)
+        0x4eb3f658u,   // fmin  v24.4s, v18.4s, v19.4s (c_second=false: min(-0,+0) = -0)
+        kMrsX0Fpsr,
+    };
+    for (const int opt : {0, 1}) {
+        runner.machine.options.optimize = static_cast<std::int8_t>(opt);
+        for (const std::int32_t iv : {0, 1, -1, 5, -5}) {
+            auto ctx = runner.context(99400 + static_cast<unsigned>(iv + 10));
+            ctx.x[1] = static_cast<std::uint32_t>(iv);
+            ctx.x[2] = static_cast<std::uint64_t>(iv < 0 ? 0 : iv);
+            const auto p0 = pack4(0u, static_cast<std::uint32_t>(iv), static_cast<std::uint32_t>(-iv), 0xffffffffu);
+            ctx.v[0][0] = p0.first; ctx.v[0][1] = p0.second;
+            FX_CHECK(runner.run(u3_scvtf, ctx, "wave u3 scvtf const minmax"));
+            FX_CHECK_EQ(runner.actual.x[0] & 1u, 0u);
+        }
+    }
+
+    // 2. U3b: Clamp chain `FADD (quiet) -> FMAXNM(x, +0.0) [now non_nan!] -> FMINNM(y, 1.0)`
+    //    (scalar and vector): qNaN yields 0.0 with IOC==0; sNaN sets IOC==1!
+    const std::vector<std::uint32_t> u3_clamp = {
+        kMsrFpsrXzr,
+        0x1e222821u,   // fadd   s1, s1, s2       (quiet32)
+        0x1e2703e3u,   // fmov   s3, wzr          (+0.0)
+        0x1e2e1004u,   // fmov   s4, #1.0
+        0x1e236825u,   // fmaxnm s5, s1, s3       (quiet + non_nan -> non_nan32!)
+        0x1e2478a6u,   // fminnm s6, s5, s4       (one_insn vminss!)
+        0x4e22d427u,   // fadd   v7.4s, v1.4s, v2.4s (quiet32)
+        0x4f000408u,   // movi   v8.4s, #0
+        0x4f03f609u,   // fmov   v9.4s, #1.0
+        0x4e28c4e5u,   // fmaxnm v5.4s, v7.4s, v8.4s  (non_nan32!)
+        0x4ea9c4aau,   // fminnm v10.4s, v5.4s, v9.4s (one_insn vminps!)
+        kMrsX0Fpsr,
+    };
+    for (const int opt : {0, 1}) {
+        runner.machine.options.optimize = static_cast<std::int8_t>(opt);
+        for (const auto [v1_lane0, want_ioc] :
+             {std::pair{0x7fc00001u, 0u}, std::pair{0x7fa00001u, 1u}, std::pair{0x80000000u, 0u},
+              std::pair{0xbf800000u, 0u}, std::pair{0x3f000000u, 0u}, std::pair{0x40400000u, 0u}}) {
+            auto ctx = runner.context(99450);
+            const auto p1 = pack4(v1_lane0, 0x80000000u, 0x3f000000u, 0x40000000u);
+            const auto p2 = pack4(0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u);
+            ctx.v[1][0] = p1.first; ctx.v[1][1] = p1.second;
+            ctx.v[2][0] = p2.first; ctx.v[2][1] = p2.second;
+            FX_CHECK(runner.run(u3_clamp, ctx, "wave u3 clamp chain"));
+            FX_CHECK_EQ(runner.actual.x[0] & 1u, want_ioc);
+        }
+    }
+
+    // 3. U4: Transitive vec_sz_dead_after through FMIN -> FNEG -> FMAX -> FCMGE
+    //    plus standalone FMIN -> FMIN -> FCMGE (both sz_dead AND live signed-zero control).
+    const std::vector<std::uint32_t> u4_sz_prop = {
+        kMsrFpsrXzr,
+        // Standalone FMIN (v8) -> FNEG (v9, killing v8) -> FMAX (v9) -> FCMGE (v9, killing v9):
+        0x4ea2f428u,   // fmin  v8.4s, v1.4s, v2.4s
+        0x6ea0f909u,   // fneg  v9.4s, v8.4s
+        0x4f000408u,   // movi  v8.4s, #0          (kills v8 before FCMGE!)
+        0x4e23f529u,   // fmax  v9.4s, v9.4s, v3.4s
+        0x6e24e529u,   // fcmge v9.4s, v9.4s, v4.4s (sz-insensitive, overwrites v9!)
+        // Control: v10 escapes alive (must keep exact -0.0 vs +0.0!)
+        0x4ea2f42au,   // fmin  v10.4s, v1.4s, v2.4s
+        0x4e22f42bu,   // fmax  v11.4s, v1.4s, v2.4s
+        kMrsX0Fpsr,
+    };
+    for (const int opt : {0, 1}) {
+        runner.machine.options.optimize = static_cast<std::int8_t>(opt);
+        for (unsigned k = 0; k < 6; ++k) {
+            auto ctx = runner.context(99500 + k);
+            const std::uint32_t z0 = (k & 1) ? 0x00000000u : 0x80000000u;
+            const std::uint32_t z1 = (k & 1) ? 0x80000000u : 0x00000000u;
+            const std::uint32_t v3 = (k == 4) ? 0x7fc00001u : (k == 5) ? 0x7fa00001u : 0xbf000000u;
+            const auto p1 = pack4(z0, z1, 0x3f800000u, 0xbf800000u);
+            const auto p2 = pack4(z1, z0, 0x00000000u, 0x80000000u);
+            const auto p3 = pack4(v3, 0x00000000u, 0x80000000u, 0x3f000000u);
+            const auto p4 = pack4(0x00000000u, 0x80000000u, 0x3f800000u, 0x00000000u);
+            ctx.v[1][0] = p1.first; ctx.v[1][1] = p1.second;
+            ctx.v[2][0] = p2.first; ctx.v[2][1] = p2.second;
+            ctx.v[3][0] = p3.first; ctx.v[3][1] = p3.second;
+            ctx.v[4][0] = p4.first; ctx.v[4][1] = p4.second;
+            FX_CHECK(runner.run(u4_sz_prop, ctx, "wave u4 sz_dead propagation " + std::to_string(k)));
+        }
+    }
+    runner.machine.reset();
+    runner.machine.options.optimize = -1;
+}

@@ -1544,8 +1544,68 @@ void RegionEmitter::cond_branch(Cond c, std::int32_t taken, std::uint64_t taken_
     const auto state = flags_;
     const auto dst = taken >= 0 ? taken_label(taken, state)
                                 : add_stub(Stub::K::direct_exit, state, current_dirty(), taken_pc, -1, dirty_snap());
-    if (taken >= 0) jcc_label(c, dst);
-    else a_.jcc(c, dst);
+    if (cset_cold_inst_ == index_ && cset_cold_fix_count_ > 0) {
+        struct ResolvedFix {
+            std::uint8_t guest;
+            bool is_pin;
+            Gp pin_reg;
+            bool is_lit;
+            std::uint8_t lit_bits;
+            std::uint64_t val;
+        };
+        struct FixPack {
+            ResolvedFix items[4];
+            unsigned count;
+        };
+        FixPack pack{{}, cset_cold_fix_count_};
+        for (unsigned i = 0; i < pack.count; ++i) {
+            const auto& f = cset_cold_fixes_[i];
+            const bool p = pinned(f.guest);
+            pack.items[i] = {f.guest, p, p ? pin(f.guest) : Gp::none, f.is_lit, f.lit_bits, f.val};
+        }
+        const std::uint32_t avail_tmp = 0x0307u & ~plan_.pin_hosts & ~gc_.mask;
+        const Gp lit_tmp = avail_tmp != 0 ? x64::gp(static_cast<unsigned>(std::countr_zero(avail_tmp))) : Gp::none;
+        cset_cold_inst_ = -1;
+        cset_cold_fix_count_ = 0;
+        const auto cold_lbl = a_.new_label();
+        a_.jcc(c, cold_lbl);
+        defer_cold([this, cold_lbl, dst, pack, lit_tmp]() {
+            a_.bind(cold_lbl);
+            for (unsigned i = 0; i < pack.count; ++i) {
+                const auto& f = pack.items[i];
+                if (f.is_lit) {
+                    if (f.is_pin) {
+                        fixup_imm64(f.pin_reg, f.val);
+                        a_.mov(f.lit_bits, f.pin_reg, ptr(f.pin_reg, 0));
+                    } else if (lit_tmp != Gp::none) {
+                        fixup_imm64(lit_tmp, f.val);
+                        a_.mov(f.lit_bits, lit_tmp, ptr(lit_tmp, 0));
+                        a_.mov(64, gmem(f.guest), lit_tmp);
+                    } else {
+                        a_.push(Gp::rax);
+                        fixup_imm64(Gp::rax, f.val);
+                        a_.mov(f.lit_bits, Gp::rax, ptr(Gp::rax, 0));
+                        a_.mov(64, gmem(f.guest), Gp::rax);
+                        a_.pop(Gp::rax);
+                    }
+                } else if (f.is_pin) {
+                    if (f.val <= 0xffffffffULL) a_.mov_imm(f.pin_reg, f.val);
+                    else mov_literal(f.pin_reg, f.val);
+                } else if (f.val == 0 || f.val == 1) {
+                    a_.mov(64, gmem(f.guest), static_cast<std::int32_t>(f.val));
+                } else if (f.val == ~0ULL) {
+                    a_.mov(64, gmem(f.guest), -1);
+                } else {
+                    a_.mov(32, gmem(f.guest), static_cast<std::int32_t>(f.val));
+                    a_.mov(32, ptr(Gp::r15, x_disp(f.guest) + 4), static_cast<std::int32_t>(f.val >> 32));
+                }
+            }
+            a_.jmp(dst);
+        });
+    } else {
+        if (taken >= 0) jcc_label(c, dst);
+        else a_.jcc(c, dst);
+    }
     if (ccmp_cold_inst_ == index_) {
         const auto lfalse = ccmp_cold_label_;
         const unsigned nz = ccmp_cold_nzcv_;
@@ -2503,6 +2563,8 @@ void RegionEmitter::run() {
     zf_inst_ = -1;
     logic_flags_inst_ = -1;
     cset_inst_ = -1;
+    cset_cold_inst_ = -1;
+    cset_cold_fix_count_ = 0;
     ccmp_cold_inst_ = -1;
     clear_lit_base();
     // Tier 2 (region_alloc.cpp): liveness, dropped interrupt checks; pass 2
@@ -3031,26 +3093,38 @@ bool is_fp_minmax_word(std::uint32_t w) {
     return (w & 0xbf20fc00u) == 0x0e20c400u || (w & 0xbf20fc00u) == 0x0e20f400u;
 }
 
-// The quiet bits (FpConst::quiet) of a 128-bit value: bit 0 = no 32-bit
-// element is a signalling NaN, bit 1 = no 64-bit element is.
+// The quiet/non-NaN bits (FpConst::quiet) of a 128-bit value:
+//   bit 0 (0x1) = no 32-bit element is a signalling NaN
+//   bit 1 (0x2) = no 64-bit element is a signalling NaN
+//   bit 2 (0x4) = no 32-bit element is any NaN (quiet or signalling)
+//   bit 3 (0x8) = no 64-bit element is any NaN (quiet or signalling)
 std::uint8_t quiet_bits(std::uint64_t lo, std::uint64_t hi) {
     const auto snan32 = [](std::uint64_t v) { return (v & 0x7fc00000u) == 0x7f800000u && (v & 0x3fffffu) != 0; };
     const auto snan64 = [](std::uint64_t v) {
         return (v & 0x7ff8000000000000ull) == 0x7ff0000000000000ull && (v & 0x7ffffffffffffull) != 0;
     };
-    bool q32 = true;
+    const auto nan32 = [](std::uint64_t v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+    const auto nan64 = [](std::uint64_t v) { return (v & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+    bool q32 = true, nn32 = true;
     for (const std::uint64_t word : {lo, hi})
-        for (unsigned k = 0; k < 2; ++k) q32 &= !snan32((word >> (32 * k)) & 0xffffffffu);
-    return static_cast<std::uint8_t>((q32 ? 1u : 0u) | (!snan64(lo) && !snan64(hi) ? 2u : 0u));
+        for (unsigned k = 0; k < 2; ++k) {
+            const auto lane = (word >> (32 * k)) & 0xffffffffu;
+            q32 &= !snan32(lane);
+            nn32 &= !nan32(lane);
+        }
+    const bool q64 = !snan64(lo) && !snan64(hi);
+    const bool nn64 = !nan64(lo) && !nan64(hi);
+    return static_cast<std::uint8_t>((q32 ? 1u : 0u) | (q64 ? 2u : 0u) | (nn32 ? 4u : 0u) | (nn64 ? 8u : 0u));
 }
 
 // An FP arithmetic result written to Vd (A64 never produces a signalling NaN,
-// FPCR.DN or not): its quiet bits, or 0 if `w` is not one. Scalar S results
-// are zero above bit 31 (also no 64-bit sNaN); scalar D and vector results
-// cover their element size. FMOV, FABS, FNEG, FCSEL, loads and moves copy a
-// signalling NaN and are not listed.
+// FPCR.DN or not): its quiet/non-NaN bits, or 0 if `w` is not one. Scalar S
+// results are zero above bit 31 (also no 64-bit NaN); integer-to-FP converts
+// (SCVTF/UCVTF) never produce NaN. FMOV, FABS, FNEG, FCSEL, loads and moves
+// copy a signalling NaN and are not listed.
 std::uint8_t fp_arith_quiet(std::uint32_t w) {
     const auto scalar = [](unsigned type) -> std::uint8_t { return type == 0 ? 3 : type == 1 ? 2 : 0; };
+    const auto scalar_nn = [](unsigned type) -> std::uint8_t { return type == 0 ? 0xfu : type == 1 ? 0xau : 0u; };
     if ((w & 0xff200c00u) == 0x1e200800u && ((w >> 12) & 15u) <= 8) return scalar((w >> 22) & 3u);   // 2-source
     if ((w & 0xff000000u) == 0x1f000000u) return scalar((w >> 22) & 3u);                              // FMADD...
     if ((w & 0xff207c00u) == 0x1e204000u) {                                                           // 1-source
@@ -3060,10 +3134,11 @@ std::uint8_t fp_arith_quiet(std::uint32_t w) {
         if (opcode == 5) return 2;                                                         // FCVT Dd
         return 0;
     }
-    if ((w & 0x7f3e0000u) == 0x1e220000u) return scalar((w >> 22) & 3u);   // SCVTF/UCVTF from W/X: never NaN
+    if ((w & 0x7f3efc00u) == 0x1e220000u) return scalar_nn((w >> 22) & 3u);   // SCVTF/UCVTF from W/X: never NaN
+    if ((w & 0x7f3e0000u) == 0x1e020000u) return scalar_nn((w >> 22) & 3u);   // fixed-point SCVTF/UCVTF from W/X
     // AdvSIMD scalar SCVTF/UCVTF (vector register source): never NaN.
     if ((w & 0xdf3e0c00u) == 0x5e200800u && !((w >> 23) & 1u) && ((w >> 12) & 31u) == 0x1d)
-        return ((w >> 22) & 1u) ? 2 : 3;
+        return ((w >> 22) & 1u) ? 0xau : 0xfu;
     // Vector three same (single/double; Q and sz free, sz=1 requires Q=1):
     // FADD, FSUB, FMUL, FDIV, FMLA, FMLS, FMAX, FMIN, FMAXNM, FMINNM, FMULX,
     // FABD, FADDP, FMAXP, FMINP, FMAXNMP, FMINNMP, FRECPS, FRSQRTS.
@@ -3084,8 +3159,9 @@ std::uint8_t fp_arith_quiet(std::uint32_t w) {
         if (!a && !u && opc == 0x17) return sz ? 2 : 1;                 // FCVTL/FCVTL2 (32->64 or 16->32)
         if (!a && opc == 0x16 && sz) return 1;                          // FCVTN/FCVTXN (64->32)
         if (q || !sz) {
-            if (!a && (opc == 0x18 || opc == 0x19 || opc == 0x1d || opc == 0x1e || opc == 0x1f))
-                return sz ? 2 : 1;                                      // FRINTN/A/M/X/32/64, SCVTF/UCVTF
+            if (!a && opc == 0x1d) return sz ? 0xau : 0x5u;             // SCVTF/UCVTF: never NaN
+            if (!a && (opc == 0x18 || opc == 0x19 || opc == 0x1e || opc == 0x1f))
+                return sz ? 2 : 1;                                      // FRINTN/A/M/X/32/64
             if (a && ((opc == 0x18 && !u) || opc == 0x19 || opc == 0x1d || (opc == 0x1f && u)))
                 return sz ? 2 : 1;                                      // FRINTP/Z/I, FRECPE/FRSQRTE, FSQRT
         }
@@ -3130,7 +3206,7 @@ void RegionEmitter::fpconst_compute() {
             s_.fpc_slot[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(leaders.size());
             leaders.push_back(i);
         }
-    s_.fpc_in.assign(leaders.size() * 32, FpConst{0, 3, 0, 0});
+    s_.fpc_in.assign(leaders.size() * 32, FpConst{0, 0xfu, 0, 0});
     std::vector<std::uint8_t> entry(static_cast<std::size_t>(n), 0);
     entry[0] = 1;
     for (const auto& e : plan_.entries)
@@ -3188,7 +3264,10 @@ void RegionEmitter::fpconst_compute() {
                 else if (opc == 2) lo ^= sb;
                 c = FpConst{1, 0, lo, 0};
             } else if (src.state == 2) {
-                c = FpConst{2, static_cast<std::uint8_t>(dbl ? (src.quiet & 2u) : ((src.quiet & 1u) ? 3u : 0u)), 0, 0};
+                const std::uint8_t qbits =
+                    dbl ? static_cast<std::uint8_t>(src.quiet & 0xau)
+                        : static_cast<std::uint8_t>(((src.quiet & 1u) ? 3u : 0u) | ((src.quiet & 4u) ? 0xcu : 0u));
+                c = FpConst{2, qbits, 0, 0};
             } else {
                 c = src;
             }
@@ -3200,7 +3279,7 @@ void RegionEmitter::fpconst_compute() {
                 c.lo = neg ? (src.lo ^ sb) : (src.lo & ~sb);
                 c.hi = q ? (neg ? (src.hi ^ sb) : (src.hi & ~sb)) : 0;
             } else if (src.state == 2) {
-                c = FpConst{2, static_cast<std::uint8_t>(dbl ? (src.quiet & 2u) : (src.quiet & 1u)), 0, 0};
+                c = FpConst{2, static_cast<std::uint8_t>(dbl ? (src.quiet & 0xau) : (src.quiet & 0x5u)), 0, 0};
             } else {
                 c = src;
             }
@@ -3216,7 +3295,7 @@ void RegionEmitter::fpconst_compute() {
                     c.lo = v | (v << 32);
                     c.hi = q ? c.lo : 0;
                 } else if (src.state == 2) {
-                    c = FpConst{2, static_cast<std::uint8_t>(src.quiet & 1u), 0, 0};
+                    c = FpConst{2, static_cast<std::uint8_t>(src.quiet & 0x5u), 0, 0};
                 } else {
                     c = src;
                 }
@@ -3225,7 +3304,7 @@ void RegionEmitter::fpconst_compute() {
                 if (src.state == 1) {
                     c.lo = c.hi = idx ? src.hi : src.lo;
                 } else if (src.state == 2) {
-                    c = FpConst{2, static_cast<std::uint8_t>(src.quiet & 2u), 0, 0};
+                    c = FpConst{2, static_cast<std::uint8_t>(src.quiet & 0xau), 0, 0};
                 } else {
                     c = src;
                 }
@@ -3251,7 +3330,19 @@ void RegionEmitter::fpconst_compute() {
             } else {
                 defined = false;
             }
-        } else if (const std::uint8_t q = fp_arith_quiet(w); q != 0 && ((pi.vwrites >> rd) & 1u)) {
+        } else if (std::uint8_t q = fp_arith_quiet(w); q != 0 && ((pi.vwrites >> rd) & 1u)) {
+            // FMAXNM/FMINNM with one non-NaN and one quiet operand never
+            // produces NaN (a lone quiet NaN yields the number; neither is sNaN).
+            const bool sc_nm = (w & 0xff200c00u) == 0x1e200800u && ((w >> 22) & 3u) < 2 &&
+                               (((w >> 12) & 15u) == 6 || ((w >> 12) & 15u) == 7);
+            const bool vec_nm = (w & 0xbf20fc00u) == 0x0e20c400u && (((w >> 30) & 1u) || !((w >> 22) & 1u));
+            if (sc_nm || vec_nm) {
+                const bool dbl = ((w >> 22) & 1u) != 0;
+                const std::uint8_t qbit = dbl ? 2u : 1u, nbit = dbl ? 8u : 4u;
+                const std::uint8_t qa = st[(w >> 5) & 31u].quiet, qb = st[(w >> 16) & 31u].quiet;
+                if (((qa & nbit) && (qb & qbit)) || ((qb & nbit) && (qa & qbit)))
+                    q |= sc_nm && !dbl ? 0xcu : nbit;
+            }
             c = FpConst{2, q, 0, 0};
         } else {
             defined = false;
@@ -3374,6 +3465,19 @@ bool RegionEmitter::vec_fp_quiet(unsigned index, unsigned es) {
     return false;
 }
 
+bool RegionEmitter::vec_fp_non_nan(unsigned index, unsigned es) {
+    if (!cur_ || (es != 32 && es != 64)) return false;
+    if (!fpconst_done_) {
+        fpconst_compute();
+        fpconst_done_ = true;
+    }
+    const auto it = std::lower_bound(s_.fpc_uses.begin(), s_.fpc_uses.end(), index_,
+                                     [](const Scratch::FpConstUse& x, std::int32_t i) { return x.index < i; });
+    for (auto x = it; x != s_.fpc_uses.end() && x->index == index_; ++x)
+        if (x->vec == index) return ((x->quiet >> (es == 64 ? 3 : 2)) & 1u) != 0;
+    return false;
+}
+
 bool RegionEmitter::vec_dead_after(unsigned consumed, unsigned index) const {
     if (index >= 32) return false;
     const auto at = index_ + static_cast<std::int32_t>(consumed) - 1;
@@ -3409,19 +3513,40 @@ bool RegionEmitter::vec_sz_dead_after(unsigned consumed, unsigned index, unsigne
         return z == 0x0ea0c800u || z == 0x2ea0c800u || z == 0x0ea0d800u || z == 0x2ea0d800u || z == 0x0ea0e800u ||
                z == 0x0ea0f800u;
     };
-    const auto bit = 1u << index;
+    // Same-width ops whose output differs at most in the sign of zero when an
+    // input does (identical non-zero lanes, NaNs, and FPSR): vector
+    // FMAX/FMIN/FMAXNM/FMINNM, vector FNEG, and 128-bit MOV Vd.16B, Vn.16B.
+    const auto is_sz_prop_vec = [want_sz](std::uint32_t w) -> bool {
+        if ((w & 0xffe0fc00u) == 0x4ea01c00u && ((w >> 16) & 31u) == ((w >> 5) & 31u)) return true;   // MOV.16B
+        const unsigned sz = (w >> 22) & 1u;
+        if (sz != want_sz) return false;
+        if (sz != 0 && ((w >> 30) & 1u) == 0) return false;   // reject invalid .1D
+        const std::uint32_t mm = w & 0xbf20fc00u;
+        if (mm == 0x0e20c400u || mm == 0x0e20f400u) return true;   // FMAXNM/FMINNM/FMAX/FMIN (.2S/.4S/.2D)
+        return (w & 0xbfbffc00u) == 0x2ea0f800u;                   // FNEG (.2S/.4S/.2D)
+    };
+    std::uint32_t tainted = 1u << index;
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     const auto start = index_ + static_cast<std::int32_t>(consumed);
-    for (std::int32_t j = start; j < n && j < start + 16; ++j) {
+    for (std::int32_t j = start; j < n && j < start + 24; ++j) {
         const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
         if (pj.leader || pj.flow != Flow::normal || pj.conservative_writes || pj.may_fault) return false;
-        if (pj.vreads & bit) {
-            if (!is_sz_insens_vec(plan_.words[static_cast<std::size_t>(j)])) return false;
+        const bool reads_tainted = (pj.vreads & tainted) != 0;
+        std::uint32_t next_tainted = tainted & ~pj.vwrites;
+        if (reads_tainted) {
+            const std::uint32_t w = plan_.words[static_cast<std::size_t>(j)];
+            if (is_sz_insens_vec(w)) {
+                // Output is independent of input zero sign.
+            } else if (is_sz_prop_vec(w) && pj.vwrites != 0) {
+                next_tainted |= pj.vwrites;
+            } else {
+                return false;
+            }
         }
-        if (pj.vwrites & bit) return true;
-        if (dead_on_ && static_cast<std::size_t>(j) < s_.olive_out.size() &&
-            ((s_.olive_out[static_cast<std::size_t>(j)] >> (32u + index)) & 1u) == 0)
-            return true;
+        tainted = next_tainted;
+        if (dead_on_ && static_cast<std::size_t>(j) < s_.olive_out.size())
+            tainted &= static_cast<std::uint32_t>(s_.olive_out[static_cast<std::size_t>(j)] >> 32);
+        if (tainted == 0) return true;
     }
     return false;
 }
